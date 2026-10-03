@@ -1,0 +1,21 @@
+# Workspace context ignore rules for AI scanning
+node_modules/
+*/node_modules/
+*/*/node_modules/
+*/*/*/node_modules/
+*.log
+*.tmp
+build/
+dist/
+docs/
+tests/old_tests/
+.git/
+*.zip
+bundle/
+__pycache__/
+*/__pycache__/
+*/*/__pycache__/
+*/*/*/__pycache__/
+.pytest_cache/
+*.pyc
+.system_generated/
