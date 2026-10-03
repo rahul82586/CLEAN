@@ -1,0 +1,27 @@
+[🏠 Document Start](../../../README.md) / [Manager API](../../README.md) / [Administrator Interface](../../Administrator-Interface.md) / [Configuration Databases](../Configuration-Databases.md) / Subscriptions
+
+[Previous](KYC/Start.md) | [Next](Subscriptions/SubscriptionCfgCreate.md)
+
+# Subscriptions
+
+With the "Subscriptions" service, you can offer additional paid services to traders directly in the client terminals. For example, you can sell subscriptions for high-quality market data from well-known providers, offer personal manager services to assist traders in understanding the basics of trading, deliver one-time services such as position transferring or currency conversion, and much more. For further details, please read the [MetaTrader 5 Administrator Help](https://support.metaquotes.net/en/docs/mt5/platform/administration/subscriptions).
+
+The functions described in this section enable the management of subscription settings:
+
+Function | Purpose  
+---|---  
+[SubscriptionCfgCreate](Subscriptions/SubscriptionCfgCreate.md) | Create a subscription configuration object.  
+[SubscriptionCfgSymbolCreate](Subscriptions/SubscriptionCfgSymbolCreate.md) | Create a subscription symbol configuration object.  
+[SubscriptionCfgNewsCreate](Subscriptions/SubscriptionCfgNewsCreate.md) | Create a subscription news configuration object.  
+[SubscriptionCfgSubscribe](Subscriptions/SubscriptionCfgSubscribe.md) | Subscribe to events and hooks associated with subscription configurations.  
+[SubscriptionCfgUnsubscribe](Subscriptions/SubscriptionCfgUnsubscribe.md) | Unsubscribe from events and hooks associated with subscription configurations.  
+[SubscriptionCfgUpdate](Subscriptions/SubscriptionCfgUpdate.md) | Add or update a subscription configuration.  
+[SubscriptionCfgUpdateBatch](Subscriptions/SubscriptionCfgUpdateBatch.md) | Add or edit multiple subscription configurations.  
+[SubscriptionCfgDelete](Subscriptions/SubscriptionCfgDelete.md) | Delete a subscription configuration by name or position.  
+[SubscriptionCfgDeleteByID](Subscriptions/SubscriptionCfgDeleteByID.md) | Delete a subscription configuration by internal ID.  
+[SubscriptionCfgDeleteBatch](Subscriptions/SubscriptionCfgDeleteBatch.md) | Delete multiple subscription configurations.  
+[SubscriptionCfgShift](Subscriptions/SubscriptionCfgShift.md) | Change the position of a subscription configuration in the list.  
+[SubscriptionCfgTotal](Subscriptions/SubscriptionCfgTotal.md) | Get the total number of subscription configurations available in the platform.  
+[SubscriptionCfgNext](Subscriptions/SubscriptionCfgNext.md) | Get a subscription configuration by index.  
+[SubscriptionCfgGet](Subscriptions/SubscriptionCfgGet.md) | Get a subscription configuration by name.  
+[SubscriptionCfgGetByID](Subscriptions/SubscriptionCfgGetByID.md) | Get a subscription configuration by ID.

@@ -1,0 +1,66 @@
+[🏠 Document Start](../../../README.md) / [Configuration Interfaces](../../README.md) / [Symbols](../../Symbols.md) / [IMTConSymbol](../IMTConSymbol.md) / VolumeLimitExt
+
+[Previous](VolumeLimit.md) | [Next](MarginFlags.md)
+
+# IMTConSymbol::VolumeLimitExt
+
+Gets the maximum aggregate volume (with extended accuracy) of positions and orders for the symbol in one direction.
+
+C++
+    
+    
+    UINT64  IMTConSymbol::VolumeLimitExt()  const
+
+.NET (Gateway/Manager API)
+    
+    
+    ulong  CIMTConSymbol.VolumeLimitExt()
+
+Python (Manager API)
+    
+    
+    MTConSymbol.VolumeLimitExt
+
+### Return Value
+
+The maximum allowed aggregate volume of positions and orders for a symbol in the UINT64 format (one unit corresponds to 1/100000000 lot, for example, 105000000 means 1.05 lots).
+
+### Note
+
+For example: if the limit is 5 lots, you may have an open position of 5 lots and place a Sell Limit order of 5 lots as well. But in this case you cannot place a pending Buy Limit order (since the total volume in one direction will exceed the limit) or place a Sell Limit order above 5 lots.
+
+# IMTConSymbol::VolumeLimitExt
+
+Sets the maximum aggregate volume (with extended accuracy) of positions and orders for the symbol in one direction.
+
+C++
+    
+    
+    MTAPIRES  IMTConSymbol::VolumeLimitExt(
+       const UINT64  volume      // Maximum aggregate volume
+       )
+
+.NET (Gateway/Manager API)
+    
+    
+    MTRetCode  CIMTConSymbol.VolumeLimitExt(
+       luong         volume      // Maximum aggregate volume
+       )
+
+Python (Manager API)
+    
+    
+    MTConSymbol.VolumeLimitExt
+
+### Program Parameters
+
+**volume**  
+[in] The maximum allowed aggregate volume of positions and orders for a symbol in the UINT64 format (one unit corresponds to 1/100000000 lot, for example, 105000000 means 1.05 lots).
+
+### Return Value
+
+An indication of successful completion is the [MT_RET_OK](../../../Return-Codes/Successful-completion.md) response code. Otherwise, an error has occurred, which corresponds to the response code.
+
+### Note
+
+For example: if the limit is 5 lots, you may have an open position of 5 lots and place a Sell Limit order of 5 lots as well. But in this case you cannot place a pending Buy Limit order (since the total volume in one direction will exceed the limit) or place a Sell Limit order above 5 lots.

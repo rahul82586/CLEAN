@@ -1,0 +1,26 @@
+[🏠 Document Start](../../../README.md) / [Configuration Interfaces](../../README.md) / [Network](../../Network.md) / [IMTConServer](../IMTConServer.md) / AddressTotal
+
+[Previous](Address.md) | [Next](AddressNext.md)
+
+# IMTConServer::AddressTotal
+
+Get the number of IPv4 addresses available on a computer.
+
+C++
+    
+    
+    UINT  IMTConServer::AddressTotal()  const
+
+.NET (Gateway/Manager API)
+    
+    
+    uint  CIMTConServer.AddressTotal()
+
+Python (Manager API)
+    
+    
+    MTConServer.AddressTotal()
+
+### Return Value
+
+The number of available  addresses.
