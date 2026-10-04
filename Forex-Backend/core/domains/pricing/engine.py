@@ -9,11 +9,21 @@ price a CLIENT of a given group sees.
 Semantics, from the MT5 Administrator guide in the reference corpus:
 
 * Symbol settings, Common (Platform-Setup.md, "Spread — spread size in
-  points"): a non-zero `Spread` makes the spread FIXED — it is "calculated
-  using the Spread balance parameter", i.e. `SpreadBalance` points of it sit
-  below the raw bid and the remainder above it, so the client spread is
-  exactly `Spread` points regardless of the feed's own spread. `Spread = 0`
-  means FLOATING: the feed's bid/ask pass through (then the difference below).
+  points", and IMTConSymbol/SpreadBalance.md): a non-zero `Spread` makes the
+  spread FIXED. `SpreadBalance` is a SINGLE signed int (the SDK declares
+  `int SpreadBalance`), a shift from the EQUAL distribution of `Spread`
+  between Bid and Ask. The guide states the three cases exactly:
+
+      feed spread == symbol spread : NewBid = Bid + B*P
+      feed spread != symbol spread : NewBid = (Ask+Bid)/2 - floor(S/2)*P
+      floating (S == 0)            : both prices shift by B*P
+
+  and NewAsk = NewBid + S*P in the first two, so the client spread is exactly
+  `Spread` points regardless of the feed's own spread. Odd `Spread` splits
+  floor(S/2) below and ceil(S/2) above, per the guide's own example: "if the
+  spread is 3, the zero spread balance corresponds to the ratio -1 Bid/+2 Ask".
+  `Spread = 0` means FLOATING *and* still shifts by the balance — a floating
+  symbol with a non-zero balance is marked up, which the previous code did not do.
 
 * Group symbol settings, Common: "Spread difference — difference of a symbol
   spread for a certain group of users from the basic spread of the symbol;
@@ -115,11 +125,14 @@ def client_quote(
 ) -> Tuple[Decimal, Decimal]:
     """Transform a raw feed quote into the client quote for these settings.
 
-    Order of operations is the guide's: the symbol's base (fixed) spread
-    first, the group's spread difference after. The client ask can never end
-    below the client bid (a negative spread is not a thing); the clamp is the
-    only silent adjustment and it can only trigger on a negative SpreadDiff
-    larger than the raw spread.
+    The three documented fixed-spread cases are decided by comparing the FEED's
+    own spread with the symbol's: MT5 anchors on the raw bid when they agree and
+    on the feed MIDPOINT when they differ. Order of operations is the guide's -
+    the symbol's base spread first, the group's spread difference after.
+
+    The client ask can never end below the client bid (a negative spread is not a
+    thing); the clamp is the only silent adjustment and it can only trigger on a
+    negative SpreadDiff larger than the raw spread.
     """
     bid = Decimal(str(raw_bid))
     ask = Decimal(str(raw_ask))
@@ -127,19 +140,40 @@ def client_quote(
     if point <= 0:
         return bid, ask  # an unconfigurable point means no transform is possible
 
-    if settings.fixed_spread > 0:
-        # Fixed spread: exactly `fixed_spread` points wide, `fixed_balance` of
-        # them below the raw bid. The feed's own ask is replaced, per the guide:
-        # "the spread will be considered fixed".
-        below = Decimal(settings.fixed_balance) * point
-        bid = bid - below
-        ask = bid + Decimal(settings.fixed_spread) * point
+    symbol_spread = _as_int(settings.fixed_spread)
+    balance = _as_int(settings.fixed_balance)
+
+    if symbol_spread > 0:
+        # Odd spreads split floor below / ceil above so bid + ask == spread
+        # exactly; the guide's "spread 3, balance 0 -> -1 Bid/+2 Ask".
+        below = Decimal(symbol_spread // 2)
+        feed_spread_points = (ask - bid) / point
+        if feed_spread_points == symbol_spread:
+            # Feed spread already equals the symbol's: shift the bid by the
+            # balance and keep the ask `spread` above it.
+            bid = bid + Decimal(balance) * point
+            ask = bid + Decimal(symbol_spread) * point
+        else:
+            # Different feed spread: anchor on the MIDPOINT, then lay the fixed
+            # spread around it.
+            mid = (ask + bid) / Decimal(2)
+            bid = mid - below * point
+            ask = bid + Decimal(symbol_spread) * point
+    elif balance:
+        # Floating spread (0) with a balance: "prices are shifted by the same
+        # Spread Balance value" - BOTH sides move, the feed's width is kept.
+        shift = Decimal(balance) * point
+        bid = bid + shift
+        ask = ask + shift
 
     if settings.spread_diff:
-        total = Decimal(settings.spread_diff) * point
-        below = Decimal(settings.spread_diff_balance) * point
-        bid = bid - below
-        ask = ask + (total - below)
+        # The group layer widens the spread by exactly `spread_diff` points and
+        # puts `spread_diff_balance` of them on the bid side. Applied to the
+        # SPREAD, not to the bid's existing distance from something else.
+        total = Decimal(_as_int(settings.spread_diff))
+        on_bid = Decimal(_as_int(settings.spread_diff_balance))
+        bid = bid - on_bid * point
+        ask = ask + (total - on_bid) * point
 
     if ask < bid:
         ask = bid

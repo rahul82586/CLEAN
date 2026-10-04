@@ -914,6 +914,70 @@ export const mockApi: AdminApi = {
         await delay();
         return symbols.map(uiSymbolRow);
     },
+    /**
+     * A small stand-in for GET /admin/symbols/schema.
+     *
+     * The real endpoint serves ~126 descriptors generated from the fieldmap and the
+     * extras registry; the mock carries only what the mock symbols actually set, so
+     * a screen that renders an empty tab against the mock is not evidence the live
+     * tab is empty.
+     */
+    async getSymbolSchema() {
+        await delay();
+        return {
+            object: 'symbol',
+            wire_section: 'ConfigSymbols',
+            fields: [
+                { field: 'name', mt5: 'Symbol', type: 'string', tab: 'common' },
+                { field: 'description', mt5: 'Description', type: 'string', tab: 'common' },
+                { field: 'digits', mt5: 'Digits', type: 'int', tab: 'common' },
+                { field: 'spread', mt5: 'Spread', type: 'int', tab: 'common', unit: 'points' },
+                { field: 'base_currency', mt5: 'CurrencyBase', type: 'string', tab: 'currency' },
+                { field: 'quote_currency', mt5: 'CurrencyProfit', type: 'string', tab: 'currency' },
+                { field: 'margin_currency', mt5: 'CurrencyMargin', type: 'string', tab: 'currency' },
+                { field: 'tick_flags', mt5: 'TickFlags', type: 'flags', tab: 'quotes' },
+                { field: 'filter_soft', mt5: 'FilterSoft', type: 'decimal', tab: 'quotes', unit: 'points' },
+                { field: 'filter_hard', mt5: 'FilterHard', type: 'decimal', tab: 'quotes', unit: 'points' },
+                { field: 'contract_size', mt5: 'ContractSize', type: 'decimal', tab: 'trade' },
+                { field: 'trade_mode', mt5: 'TradeMode', type: 'enum', tab: 'trade' },
+                { field: 'exec_mode', mt5: 'ExecMode', type: 'enum', tab: 'execution' },
+                { field: 'swap_mode', mt5: 'SwapMode', type: 'enum', tab: 'swaps' },
+                { field: 'swap_rate_wednesday', mt5: 'SwapRateWednesday', type: 'decimal', tab: 'swaps' },
+            ],
+        };
+    },
+    /** Shape-compatible with the live endpoint: MT5 Sunday-first per-day sessions. */
+    async getSymbolSessions(symbol: string) {
+        await delay();
+        const s = findSymbolByAnyName(symbol);
+        if (!s) throw new Error(`symbol ${symbol} not found`);
+        const fullDay = [{ open_minutes: 0, close_minutes: 1440 }];
+        const closed: any[] = [];
+        const names = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+        const trade_sessions = names.map((day, index) => ({
+            day,
+            index,
+            sessions: index === 0 || index === 6 ? closed : fullDay,
+        }));
+        return {
+            symbol: (s as any).symbol ?? symbol,
+            trade_sessions,
+            quote_sessions: trade_sessions,
+        };
+    },
+    /** The column-less MT5 fields, keyed as the live API keys them. */
+    async getSymbolFields(symbol: string) {
+        await delay();
+        const s = findSymbolByAnyName(symbol);
+        if (!s) throw new Error(`symbol ${symbol} not found`);
+        return {
+            tick_flags: 1,
+            filter_soft: '0',
+            filter_hard: '0',
+            swap_rate_monday: '1.00000000',
+            swap_rate_wednesday: '1.00000000',
+        };
+    },
     async getSymbolDetail(symbol: string) {
         await delay();
         const s = findSymbolByAnyName(symbol);

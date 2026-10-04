@@ -1,7 +1,7 @@
 import * as React from 'react';
 import { useSymbolDraft } from '../SymbolDraftContext';
 
-const SWAP_TYPES = [
+const SWAP_TYPES_FALLBACK = [
     { value: 'points', label: 'In points of spread' },
     { value: 'money', label: 'In absolute money values' },
     { value: 'percent', label: 'In percentage terms of position value' },
@@ -9,7 +9,11 @@ const SWAP_TYPES = [
     { value: 'reopen_bid', label: 'Reopen by Bid Price' }
 ];
 
-const DAYS_IN_YEAR = [360, 365, 366];
+// Days in year is documented as free-form: MT5 says 360 is the common default,
+// 365 and 366 are alternatives, and "you can also specify a different value
+// manually". So this is a datalist, not a fixed dropdown — a broker on a 252-day
+// convention must not be blocked by a three-item <select>.
+const DAYS_IN_YEAR_SUGGESTIONS = [360, 365, 366];
 
 export function SwapsTab(): React.ReactElement {
     const { draft, setDraft } = useSymbolDraft();
@@ -71,7 +75,7 @@ export function SwapsTab(): React.ReactElement {
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                             <span style={{ width: 100, textAlign: 'right', opacity: 0.8 }}>Swap Type:</span>
                             <select className="adm-select" style={{ flex: 1, height: 20, padding: '2px 6px', fontSize: 11 }} value={draft.swap_type} onChange={e => updateField('swap_type', e.target.value)}>
-                                {SWAP_TYPES.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
+                                {SWAP_TYPES_FALLBACK.map(t => <option key={t.value} value={t.value}>{t.label}</option>)}
                             </select>
                         </div>
 
@@ -88,7 +92,7 @@ export function SwapsTab(): React.ReactElement {
                         <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                             <span style={{ width: 100, textAlign: 'right', opacity: 0.8 }}>Yearly base:</span>
                             <select className="adm-select" style={{ flex: 1, height: 20, padding: '2px 6px', fontSize: 11 }} value={draft.swap_days_in_year} onChange={e => updateField('swap_days_in_year', parseInt(e.target.value) || 360)}>
-                                {DAYS_IN_YEAR.map(d => <option key={d} value={d}>{d} Days</option>)}
+                                {DAYS_IN_YEAR_SUGGESTIONS.map(d => <option key={d} value={d}>{d} days</option>)}
                             </select>
                         </div>
 

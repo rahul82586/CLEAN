@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from api.auth.admin_dependencies import require_right
 import json
@@ -117,12 +117,82 @@ def _to_mode_int(val: Any, default: int, mapping: Dict[str, int]) -> int:
     return default
 
 
-_CALC_MODES = {
-    "FOREX": 0, "FOREX_NO_LEVERAGE": 1, "CFD": 2, "CFD_INDEX": 3, "CFD_LEVERAGE": 4,
-    "EXCHANGE_STOCKS": 5, "EXCHANGE_FUTURES": 6, "FORTS_FUTURES": 7, "EXCHANGE_BONDS": 8,
-    "EXCHANGE_INDEX": 9, "EXCHANGE_OPTIONS": 10, "EXCHANGE_OPTIONS_MARGIN": 11,
-    "EXCHANGE_FUTURES_INDEX": 12, "CFD_FUTURES": 13, "CRYPTO": 14, "CRYPTO_LEVERAGE": 15
-}
+def _calc_mode_map() -> Dict[str, int]:
+    """Accepted Calculation names -> MT5's EnCalcMode values.
+
+    BUILT FROM THE DOMAIN ENUM rather than hand-written. The hand-written version
+    that used to live here was wrong on 11 of its 14 entries:
+
+        FOREX_NO_LEVERAGE -> 1   (MT5: 5; 1 is FUTURES)
+        EXCHANGE_STOCKS   -> 5   (MT5: 32; 5 is FOREX_NO_LEVERAGE)
+        EXCHANGE_FUTURES  -> 6   (MT5: 33)
+        FORTS_FUTURES     -> 7   (MT5: 34)
+        EXCHANGE_BONDS    -> 8   (MT5: 37)
+        EXCHANGE_OPTIONS  -> 10  (MT5: 35)
+        CRYPTO            -> 14  (not an MT5 CalcMode)
+
+    54 of the 362 symbols in the reference export are FOREX_NO_LEVERAGE, so an edit
+    round-tripping through the old map would have silently rewritten them as
+    Exchange Stocks - a different margin formula, profit formula and margin
+    currency.
+
+    Aliases are added for the spellings an operator or an older client might send,
+    but every alias points at the corrected value.
+    """
+    from core.domains.instruments.enums import CalculationMode
+
+    mapping: Dict[str, int] = {member.name: member.value for member in CalculationMode}
+    mapping.update(
+        {
+            # historical spelling used by the UI's own option list
+            "EXCHANGE_MOEXBONDS": CalculationMode.EXCHANGE_BONDS_MOEX.value,
+            "FORTS_FUTURES": CalculationMode.EXCHANGE_FUTURES_FORTS.value,
+            "EXCHANGE_OPTION": CalculationMode.EXCHANGE_OPTIONS.value,
+            "COLLATERAL": CalculationMode.SERV_COLLATERAL.value,
+            # word forms from the MT5 Administrator dialog
+            "FOREX NO LEVERAGE": CalculationMode.FOREX_NO_LEVERAGE.value,
+        }
+    )
+
+    # The Trade tab's dropdown sends its LABEL as the option value, so the label
+    # spelling has to resolve. Four labels did not, and choosing them silently kept
+    # the previous calculation mode:
+    #
+    #     "Exchange FORTS Futures"  -> EXCHANGE_FORTS_FUTURES
+    #     "Exchange MOEX Stocks"    -> EXCHANGE_MOEX_STOCKS
+    #     "Exchange MOEX Bonds"     -> EXCHANGE_MOEX_BONDS
+    #     "Exchange Margin Option"  -> EXCHANGE_MARGIN_OPTION
+    #
+    # DERIVED, not listed: each alias is every permutation of the enum member's own
+    # words, so a member added later gets its alias without anyone remembering to.
+    # Permutations rather than a fixed reordering because "MOEX Stocks" and "Stocks
+    # MOEX" are both plausible spellings and generating both costs nothing here.
+    from itertools import permutations
+
+    def _forms(words):
+        """The member's words in singular and plural. The enum says OPTIONS and the
+        Trade tab label says "Option", which is the one spelling permutations of the
+        member name alone cannot produce."""
+        singular = [w[:-1] if w.endswith("S") and len(w) > 1 else w for w in words]
+        plural = [w if w.endswith("S") else w + "S" for w in words]
+        seen = []
+        for variant in (words, singular, plural):
+            if variant not in seen:
+                seen.append(variant)
+        return seen
+
+    for member in CalculationMode:
+        words = member.name.split("_")
+        if not 2 <= len(words) <= 4:
+            continue
+        for variant in _forms(words):
+            for order in permutations(variant):
+                mapping.setdefault("_".join(order), member.value)
+
+    return mapping
+
+
+_CALC_MODES = _calc_mode_map()
 _TRADE_MODES = {
     "DISABLED": 0, "LONGONLY": 1, "LONG_ONLY": 1, "SHORTONLY": 2, "SHORT_ONLY": 2,
     "CLOSEONLY": 3, "CLOSE_ONLY": 3, "FULL": 4
@@ -258,6 +328,351 @@ async def create_symbol(
     return _symbol_summary(domain_sym)
 
 
+#: MT5 weekday order is SUNDAY-FIRST (index 0 = Sunday). Python's weekday() is
+#: MONDAY-first, so any translation has to go through this table rather than
+#: through weekday(). infrastructure.mt5.wire.WEEKDAY_SUNDAY_FIRST is the authority.
+_SESSION_DAY_ALIASES = {
+    "SUN": 0, "SUNDAY": 0,
+    "MON": 1, "MONDAY": 1,
+    "TUE": 2, "TUESDAY": 2,
+    "WED": 3, "WEDNESDAY": 3,
+    "THU": 4, "THURSDAY": 4,
+    "FRI": 5, "FRIDAY": 5,
+    "SAT": 6, "SATURDAY": 6,
+}
+
+
+def _normalise_session_days(raw: Any) -> Any:
+    """Coerce an inbound session calendar into MT5's 7-element Sunday-first list.
+
+    Accepts the shapes a client can reasonably send:
+      * MT5's own ``[[{"Open": "0", "Close": "1440"}], ...]``
+      * ``{"SUN": [...], "MON": [...]}`` keyed by weekday name
+      * ``[{"day": 0, "sessions": [...]}, ...]`` (what codec.parse_sessions returns)
+
+    Returns None when the value cannot be interpreted, so the caller leaves the
+    stored column untouched rather than writing a half-understood calendar.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw)
+        except Exception:
+            return None
+
+    if isinstance(raw, dict):
+        days: List[Any] = [[] for _ in range(7)]
+        for key, value in raw.items():
+            index = _SESSION_DAY_ALIASES.get(str(key).strip().upper())
+            if index is None:
+                continue
+            days[index] = _session_ranges(value)
+        return days
+
+    if isinstance(raw, list):
+        # Already a 7-slot list?
+        if len(raw) == 7 and not any(
+            isinstance(entry, dict) and "day" in entry for entry in raw
+        ):
+            return [_session_ranges(entry) for entry in raw]
+        # The parsed per-day dicts.
+        days = [[] for _ in range(7)]
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            index = entry.get("index", entry.get("day"))
+            if isinstance(index, str):
+                index = _SESSION_DAY_ALIASES.get(index.strip().upper())
+            try:
+                index = int(index)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= index <= 6:
+                days[index] = [
+                    {"Open": str(int(s.get("open_minutes", 0))),
+                     "Close": str(int(s.get("close_minutes", 0)))}
+                    for s in (entry.get("sessions") or [])
+                    if isinstance(s, dict)
+                ]
+        return days
+
+    return None
+
+
+def _session_ranges(value: Any) -> List[Dict[str, str]]:
+    """One day's ranges, in MT5's ``{"Open", "Close"}`` minute form."""
+    out: List[Dict[str, str]] = []
+    for entry in value or []:
+        if not isinstance(entry, dict):
+            continue
+        open_min = entry.get("Open", entry.get("open_minutes", entry.get("start")))
+        close_min = entry.get("Close", entry.get("close_minutes", entry.get("end")))
+        try:
+            open_val = _session_minutes(open_min)
+            close_val = _session_minutes(close_min)
+        except (TypeError, ValueError):
+            continue
+        out.append({"Open": str(open_val), "Close": str(close_val)})
+    return out
+
+
+def _session_minutes(value: Any) -> int:
+    """Minutes from midnight. Accepts 1440 and the string "24:00" as END OF DAY.
+
+    MT5 stores a session close of 1440 for a day that runs to midnight, so this
+    must round-trip 1440 rather than clamping it to 23:59 - clamping would silently
+    shorten every full-day session by one minute.
+    """
+    if value is None or value == "":
+        raise ValueError("empty")
+    if isinstance(value, str) and ":" in value:
+        hours, _, minutes = value.partition(":")
+        total = int(hours) * 60 + int(minutes or 0)
+    else:
+        total = int(value)
+    return max(0, min(1440, total))
+
+
+def _sessions_from_hours(hours: str) -> Any:
+    """Parse the modal's "MON,00:00-24:00;TUE,00:00-24:00" form.
+
+    Returns None when nothing parsed, so a malformed string cannot blank a
+    schedule that was already configured.
+    """
+    from infrastructure.mt5.codec import _to_int  # noqa: F401  (kept for symmetry)
+
+    days: List[Any] = [[] for _ in range(7)]
+    seen = False
+    for chunk in hours.split(";"):
+        chunk = chunk.strip()
+        if not chunk or "," not in chunk:
+            continue
+        day_name, _, ranges = chunk.partition(",")
+        index = _SESSION_DAY_ALIASES.get(day_name.strip().upper())
+        if index is None:
+            continue
+        for pair in ranges.split(","):
+            pair = pair.strip()
+            if "-" not in pair:
+                continue
+            start, _, end = pair.partition("-")
+            try:
+                open_val = _session_minutes(start.strip())
+                close_val = _session_minutes(end.strip())
+            except (TypeError, ValueError):
+                continue
+            days[index].append({"Open": str(open_val), "Close": str(close_val)})
+            seen = True
+    return days if seen else None
+
+
+#: MT5 EnSwapMode, for the Swaps tab. Derived from the domain enum so it cannot
+#: drift from the values the trade server uses.
+def _swap_mode_map() -> Dict[str, int]:
+    from core.domains.instruments.enums import SwapMode
+
+    mapping: Dict[str, int] = {member.name: member.value for member in SwapMode}
+    mapping.update({
+        # the labels the Swaps tab shows
+        "POINTS": SwapMode.POINTS.value,
+        "MONEY": SwapMode.SYMBOL_CURRENCY.value,
+        "PERCENT": SwapMode.INTEREST_CURRENT.value,
+        "REOPEN_CLOSE": SwapMode.REOPEN_CLOSE_PRICE.value,
+        "REOPEN_BID": SwapMode.REOPEN_BID.value,
+        # spellings a client may send
+        "DISABLED": SwapMode.DISABLED.value,
+        "BASE_CURRENCY": SwapMode.SYMBOL_CURRENCY.value,
+        "INTEREST_CURRENT": SwapMode.INTEREST_CURRENT.value,
+        "INTEREST_OPEN": SwapMode.INTEREST_OPEN.value,
+    })
+    return mapping
+
+
+_SWAP_MODES = _swap_mode_map()
+
+#: MT5 EnSwapDays is SUNDAY-FIRST: 0=Sunday .. 6=Saturday, 7=triple swap disabled.
+#: This is NOT Python's weekday(), which is Monday-first - using weekday() here
+#: would move the triple-swap day by one, which is a real cost to the broker.
+_SWAP_DAY_NAMES = {
+    "SUNDAY": 0, "SUN": 0,
+    "MONDAY": 1, "MON": 1,
+    "TUESDAY": 2, "TUE": 2,
+    "WEDNESDAY": 3, "WED": 3,
+    "THURSDAY": 4, "THU": 4,
+    "FRIDAY": 5, "FRI": 5,
+    "SATURDAY": 6, "SAT": 6,
+    "DISABLED": 7, "NONE": 7,
+}
+
+
+def _swap_day(value: Any, default: int) -> int:
+    """Resolve the triple-swap weekday to MT5's Sunday-first index."""
+    if isinstance(value, str):
+        named = _SWAP_DAY_NAMES.get(value.strip().upper())
+        if named is not None:
+            return named
+        try:
+            value = int(value)
+        except (TypeError, ValueError):
+            return default
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if 0 <= number <= 7 else default
+
+
+def _volume_to_wire(value: Any) -> Decimal:
+    """Lots -> the scaled integer the volume columns hold.
+
+    MT5 carries `VolumeMin` as `100` for 0.01 lots, i.e. lots x 10^4, with an `*Ext`
+    sibling at x 10^8 carrying more precision. Our columns hold the x 10^4 form, which
+    is what `_volume_ext`, `db_to_symbol` and 360 of 362 imported rows already agree
+    on.
+
+    The exponent is imported from the codec rather than written here, so a change to
+    the wire format cannot leave this conversion behind.
+    """
+    from infrastructure.mt5.codec import VOLUME_WIRE_EXPONENT
+
+    return Decimal(str(value)) * (Decimal(10) ** VOLUME_WIRE_EXPONENT)
+
+
+def _first_present(containers: Any, keys: Any) -> Any:
+    """The first non-None value for any of `keys`, searched across `containers`.
+
+    The handler grew two input shapes - top-level `body` and the nested
+    `settings_json` blob - and the fields were read from whichever one the original
+    author happened to pick. Searching both, under every alias, is what stops a
+    field being accepted and then silently dropped.
+    """
+    body, settings = containers
+    for key in keys:
+        for container in (body, settings):
+            if isinstance(container, dict) and container.get(key) is not None:
+                return container[key]
+    return None
+
+
+def _int_mask(value: Any, default: int, names: Optional[Dict[str, int]] = None) -> int:
+    """A flag field as an integer mask.
+
+    The frontend renders these as CHECKBOXES and sends an array of set-bit names,
+    so a list has to be folded into the bitmask the column and the MT5 wire both
+    hold. An integer passes straight through.
+    """
+    if value is None:
+        return default
+    if isinstance(value, int):
+        return value
+    if isinstance(value, str):
+        try:
+            return int(value)
+        except ValueError:
+            pass
+    if isinstance(value, (list, tuple, set)):
+        table = names or {}
+        total = 0
+        for item in value:
+            if isinstance(item, str):
+                bit = table.get(item.strip().lower())
+                if bit is None:
+                    # Unknown member: raise rather than silently drop a permission
+                    # the operator ticked.
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail=f"unknown flag {item!r}",
+                    )
+                total |= bit
+            else:
+                total |= int(item)
+        return total
+    return default
+
+
+def _known_symbol_keys() -> frozenset:
+    """Every key PUT /admin/symbols/{name} understands.
+
+    Built from the same sources as the schema endpoint, so the two cannot disagree
+    about what is writable:
+
+      * the extras registry — the MT5 fields with no dedicated column, under their
+        stable JSON keys;
+      * the MT5 wire names those fields are stored under;
+      * the alias spellings this handler already accepts historically;
+      * the control keys (settings_json, body-only switches).
+
+    Computed once and cached, because it is read on every PUT.
+    """
+    global _KNOWN_SYMBOL_KEYS_CACHE
+    try:
+        return _KNOWN_SYMBOL_KEYS_CACHE
+    except NameError:
+        pass
+
+    from core.domains.instruments import symbol_extras
+
+    keys = set()
+
+    # mt5_extra fields, under their JSON key, their wire name, and any ALIAS the UI uses.
+    # The alias set is read from the registry rather than repeated here: `chart_mode` was
+    # missing from this list and its own tab's dropdown was rejected, which is the same
+    # failure `splice_type` produced on the other tab.
+    for field in symbol_extras.EXTRA_FIELDS:
+        keys.add(field.key)
+        keys.add(field.wire)
+    keys.update(symbol_extras.ALIASES)
+    # The whole quarantine is addressable by wire name, which is what an MT5-style
+    # client sends and what the schema reports in `mt5`.
+    keys.add("extra")
+    keys.add("mt5_extra")
+
+    # Control keys the handler reads on purpose.
+    keys.update({
+        "settings_json", "session_hours", "sessions_quotes", "sessions_trades",
+        "symbol", "name", "path", "description", "digits", "point", "tick_size",
+        "mt5_tick_size", "tick_value", "contract_size",
+        "base_currency", "quote_currency", "margin_currency", "currency",
+        "spread", "spread_base", "spread_balance", "spread_diff",
+        "spread_diff_balance", "stops_level", "limit_stop_level", "freeze_level",
+        "volume_min", "volume_max", "volume_step", "volume_limit",
+        "min_volume", "max_volume", "step_volume", "limit_volume",
+        "calc_mode", "calculation", "trade_mode", "exec_mode", "execution_mode",
+        "gtc_mode", "fill_flags", "filling_flags", "expiration_flags",
+        "order_flags", "orders_allowed", "is_trade_allowed", "trade_allowed",
+        "swap_triple_day", "swap_days_in_year",
+        "margin_hedged", "margin_initial", "margin_maintenance",
+        # The Margin Rates tab's own 12 keys. They were missing from this list even
+        # though the handler's `rate_map` below writes them, so the unknown-key guard
+        # refused them and the whole tab could not save. Derived from `rate_map`
+        # rather than repeated, so the two cannot disagree again.
+        "rate_market_buy_init", "rate_market_buy_maint",
+        "rate_market_sell_init", "rate_market_sell_maint",
+        "rate_limit_buy_init", "rate_limit_buy_maint",
+        "rate_limit_sell_init", "rate_limit_sell_maint",
+        "rate_stop_buy_init", "rate_stop_buy_maint",
+        "rate_stop_sell_init", "rate_stop_sell_maint",
+        "rate_stoplimit_buy_init", "rate_stoplimit_buy_maint",
+        "rate_stoplimit_sell_init", "rate_stoplimit_sell_maint",
+        # the column names the nested `margin_rates` dict path accepts
+        "margin_initial_buy", "margin_initial_sell",
+        "margin_initial_buy_limit", "margin_initial_sell_limit",
+        "margin_initial_buy_stop", "margin_initial_sell_stop",
+        "margin_initial_buy_stop_limit", "margin_initial_sell_stop_limit",
+        "margin_maintenance_buy", "margin_maintenance_sell",
+        "margin_maintenance_buy_limit", "margin_maintenance_sell_limit",
+        "margin_maintenance_buy_stop", "margin_maintenance_sell_stop",
+        "margin_maintenance_buy_stop_limit", "margin_maintenance_sell_stop_limit",
+        "margin_rates",
+        "calc_hedged_larger_leg", "swap_mode", "swap_long", "swap_short",
+        "swap_3day", "swap_year_days", "option_mode", "strike_price",
+        "face_value", "face_value_currency",
+    })
+    _KNOWN_SYMBOL_KEYS_CACHE = frozenset(keys)
+    return _KNOWN_SYMBOL_KEYS_CACHE
+
+
 @symbols_skeleton.put("/{symbol_name:path}")
 async def update_symbol(
     symbol_name: str,
@@ -266,6 +681,20 @@ async def update_symbol(
 ) -> Dict[str, Any]:
     norm_name = symbol_name.replace("/", "\\")
     clean_name = norm_name.split("\\")[-1] if "\\" in norm_name else norm_name
+
+    # Refuse unknown keys BEFORE touching the row. The handler below is a chain of
+    # `if "<name>" in body` tests, so an unrecognised key used to be dropped in
+    # silence and the caller still got a 200 - which is how a session edit could
+    # look saved and be stored nowhere. A typo now fails loudly.
+    unknown = sorted(set(body or {}) - _known_symbol_keys())
+    if unknown:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                "Unknown symbol field(s): " + ", ".join(unknown)
+                + ". These have no effect and were refused rather than ignored."
+            ),
+        )
 
     model = await symbol_repo.find_row_by_name(norm_name)
     if not model and clean_name != norm_name:
@@ -342,33 +771,68 @@ async def update_symbol(
     if "description" in body or "description" in settings_dict:
         model.description = str(body.get("description", settings_dict.get("description", model.description)))
 
+    # --- volumes: the API speaks LOTS, the column holds MT5's wire integer ----
+    #
+    # Measured on the live database: 360 of 362 rows satisfy
+    # `column == their own mt5_source wire value`, and `_volume_ext` derives
+    # `VolumeMinExt = column x 10^4` - both only true when the column holds the
+    # SCALED INTEGER. `db_to_symbol` divides by 10^4 on read to produce lots, which is
+    # the unit the engine and validate_volume use.
+    #
+    # Writing the API value straight in put lots where an integer belonged, so every
+    # volume edited through this endpoint was stored 10^4 too small: ETHUSD ended up
+    # with the engine seeing a 0.1-lot maximum on a symbol the server allows 1000 lots
+    # on, and a 1-lot order was rejected. `_volume_to_wire` applies the conversion the
+    # reader already assumes.
     if "volume_min" in settings_dict or "volume_min" in body or "min_volume" in settings_dict:
         v_min = settings_dict.get("volume_min", body.get("volume_min", settings_dict.get("min_volume")))
-        if v_min is not None: model.volume_min = Decimal(str(v_min))
+        if v_min is not None:
+            model.volume_min = _volume_to_wire(v_min)
 
     if "volume_max" in settings_dict or "volume_max" in body or "max_volume" in settings_dict:
         v_max = settings_dict.get("volume_max", body.get("volume_max", settings_dict.get("max_volume")))
-        if v_max is not None: model.volume_max = Decimal(str(v_max))
+        if v_max is not None:
+            model.volume_max = _volume_to_wire(v_max)
 
     if "volume_step" in settings_dict or "volume_step" in body or "step_volume" in settings_dict:
         v_step = settings_dict.get("volume_step", body.get("volume_step", settings_dict.get("step_volume")))
-        if v_step is not None: model.volume_step = Decimal(str(v_step))
+        if v_step is not None:
+            model.volume_step = _volume_to_wire(v_step)
 
     if "volume_limit" in settings_dict or "volume_limit" in body or "limit_volume" in settings_dict:
         v_lim = settings_dict.get("volume_limit", body.get("volume_limit", settings_dict.get("limit_volume")))
-        if v_lim is not None: model.volume_limit = Decimal(str(v_lim))
+        if v_lim is not None:
+            model.volume_limit = _volume_to_wire(v_lim)
 
-    if "calc_mode" in settings_dict:
-        model.calc_mode = _to_mode_int(settings_dict["calc_mode"], model.calc_mode, _CALC_MODES)
+    # The three mode fields used to be read from `settings_dict` ONLY, so a
+    # top-level `calc_mode` was ignored - and so was `calculation`, which is the key
+    # the Trade tab actually sends. Proved live: of six shapes tried, only
+    # `settings_json: {"calc_mode": ...}` moved the stored value; every other one
+    # returned 200 and changed nothing.
+    #
+    # Now read from BOTH containers, under every alias the UI has used:
+    #   calc_mode / calculation
+    #   trade_mode
+    #   exec_mode / execution_mode
+    _calc_raw = _first_present(
+        (body, settings_dict), ("calc_mode", "calculation")
+    )
+    if _calc_raw is not None:
+        # The dropdown sends the human LABEL ("CFD", "Forex No Leverage"), which
+        # _to_mode_int normalises. It also accepts the integer.
+        model.calc_mode = _to_mode_int(_calc_raw, model.calc_mode, _CALC_MODES)
 
-    if "trade_mode" in settings_dict:
-        model.trade_mode = _to_mode_int(settings_dict["trade_mode"], model.trade_mode, _TRADE_MODES)
+    _trade_raw = _first_present((body, settings_dict), ("trade_mode",))
+    if _trade_raw is not None:
+        model.trade_mode = _to_mode_int(_trade_raw, model.trade_mode, _TRADE_MODES)
 
-    if "exec_mode" in settings_dict:
-        model.exec_mode = _to_mode_int(settings_dict["exec_mode"], model.exec_mode, _EXEC_MODES)
+    _exec_raw = _first_present((body, settings_dict), ("exec_mode", "execution_mode"))
+    if _exec_raw is not None:
+        model.exec_mode = _to_mode_int(_exec_raw, model.exec_mode, _EXEC_MODES)
 
-    if "is_trade_allowed" in settings_dict:
-        model.is_trade_allowed = bool(settings_dict["is_trade_allowed"])
+    _allowed = _first_present((body, settings_dict), ("is_trade_allowed", "trade_allowed"))
+    if _allowed is not None:
+        model.is_trade_allowed = bool(_allowed)
 
     # 16-way margin rate matrix
     rate_map = {
@@ -384,6 +848,12 @@ async def update_symbol(
         "rate_stop_buy_maint": "margin_maintenance_buy_stop",
         "rate_stop_sell_init": "margin_initial_sell_stop",
         "rate_stop_sell_maint": "margin_maintenance_sell_stop",
+        # The two stop-limit rows. MT5's grid has EIGHT order types; this map
+        # covered six, so a quarter of the Margin Rates tab had no write path.
+        "rate_stoplimit_buy_init": "margin_initial_buy_stop_limit",
+        "rate_stoplimit_buy_maint": "margin_maintenance_buy_stop_limit",
+        "rate_stoplimit_sell_init": "margin_initial_sell_stop_limit",
+        "rate_stoplimit_sell_maint": "margin_maintenance_sell_stop_limit",
     }
     for ui_k, db_k in rate_map.items():
         if ui_k in settings_dict or ui_k in body:
@@ -419,6 +889,95 @@ async def update_symbol(
     extra["fill_flags"] = model.fill_flags
     if "margin_hedged" in body or "margin_hedged" in settings_dict:
         extra["margin_hedged"] = str(body.get("margin_hedged", settings_dict.get("margin_hedged", 0)))
+    # --- sessions ---------------------------------------------------------
+    # These were accepted by the request body and then thrown away, because nothing
+    # in this handler read them: the modal sends `session_hours` on every save and
+    # PUT answered 200 while the schedule never changed.
+    #
+    # Two shapes are accepted, because two producers exist:
+    #   * `sessions_quotes` / `sessions_trades` - a 7-element Sunday-first list of
+    #     {Open, Close} minute ranges, which is MT5's own wire shape (see
+    #     codec.parse_sessions). This is what our API serves and what an MT5 import
+    #     round-trips through.
+    #   * `session_hours` - the modal's compact "MON,00:00-24:00;TUE,..." string.
+    for _wire, _column in (("sessions_quotes", "sessions_quotes_json"),
+                           ("sessions_trades", "sessions_trades_json")):
+        if _wire in body or _wire in settings_dict:
+            _raw = body.get(_wire, settings_dict.get(_wire))
+            _days = _normalise_session_days(_raw)
+            if _days is not None:
+                setattr(model, _column, _days)
+            elif _raw is None:
+                setattr(model, _column, [])
+
+    _hours = body.get("session_hours", settings_dict.get("session_hours"))
+    if isinstance(_hours, str) and _hours.strip():
+        _parsed = _sessions_from_hours(_hours)
+        if _parsed:
+            # One string carries both calendars; apply to trades, and to quotes
+            # only when the caller did not send an explicit quote calendar.
+            if "sessions_trades" not in body and "sessions_trades" not in settings_dict:
+                model.sessions_trades_json = _parsed
+            if "sessions_quotes" not in body and "sessions_quotes" not in settings_dict:
+                model.sessions_quotes_json = _parsed
+
+    # --- GTC, order types, expirations, trade flags, swaps -----------------
+    # None of these had a branch, so a PUT naming them passed the allow-list and
+    # then reached the end of this function untouched: HTTP 200, nothing stored.
+    # Each is written to its own COLUMN, because the export reads the column - a
+    # value parked in mt5_extra would round-trip through import/export but never
+    # reach the trade server.
+
+    _gtc = _first_present((body, settings_dict), ("gtc_mode",))
+    if _gtc is not None:
+        model.gtc_mode = int(_gtc)
+
+    _order_flags = _first_present((body, settings_dict), ("order_flags", "orders_allowed"))
+    if _order_flags is not None:
+        model.order_flags = _int_mask(_order_flags, model.order_flags)
+
+    _expir = _first_present((body, settings_dict), ("expiration_flags",))
+    if _expir is not None:
+        model.expiration_flags = _int_mask(
+            _expir, model.expiration_flags,
+            names={"none": 0, "gtc": 1, "day": 2, "specified": 4, "time": 4,
+                   "specified_day": 8, "day_specified": 8},
+        )
+
+    _trade_flags = _first_present((body, settings_dict), ("trade_flags",))
+    if _trade_flags is not None:
+        # Stored under the registry's wire name, because `trade_flags` is not a
+        # column and TradeFlags is what the exporter emits.
+        from core.domains.instruments import symbol_extras as _se
+        _field = _se.BY_KEY.get("trade_flags")
+        if _field is not None:
+            extra, _ = _se.apply_updates(extra, {"trade_flags": _trade_flags})
+
+    # Swaps. MT5's Swaps tab: mode, the two rates, the triple-swap weekday and the
+    # day-count convention. Without these the tab was decorative - reading real
+    # values from storage (once F-14b surfaced them) but unable to change any.
+    _swap_mode = _first_present((body, settings_dict), ("swap_mode",))
+    if _swap_mode is not None:
+        model.swap_mode = _to_mode_int(_swap_mode, model.swap_mode, _SWAP_MODES)
+
+    for _key, _column in (("swap_long", "swap_long"), ("swap_short", "swap_short")):
+        _value = _first_present((body, settings_dict), (_key,))
+        if _value is not None:
+            setattr(model, _column, Decimal(str(_value)))
+
+    _swap_3day = _first_present((body, settings_dict), ("swap_3day", "swap_triple_day"))
+    if _swap_3day is not None:
+        # MT5 EnSwapDays is SUNDAY-FIRST (0=Sunday .. 6=Saturday, 7=disabled), and
+        # the column stores that same numbering - so a weekday NAME has to be
+        # resolved through the table, never through Python's Monday-first weekday().
+        model.swap_3day = _swap_day(_swap_3day, model.swap_3day)
+
+    _year_days = _first_present(
+        (body, settings_dict), ("swap_year_days", "swap_days_in_year")
+    )
+    if _year_days is not None:
+        model.swap_year_days = int(_year_days)
+
     if "calc_hedged_larger_leg" in body or "calc_hedged_larger_leg" in settings_dict:
         extra["calc_hedged_larger_leg"] = bool(body.get("calc_hedged_larger_leg", settings_dict.get("calc_hedged_larger_leg", False)))
     if "margin_initial" in body or "margin_initial" in settings_dict:
@@ -433,6 +992,39 @@ async def update_symbol(
             extra["margin_maintenance"] = str(mm)
         else:
             extra.pop("margin_maintenance", None)
+    # --- the column-less MT5 fields ---------------------------------------
+    # These have no dedicated column, so they live in mt5_extra under their MT5
+    # wire names. The registry owns the key list, the coercion and the wire
+    # mapping, so this is the ONLY place that has to know about it.
+    #
+    # Without this the fields were accepted by the allow-list above, validated by
+    # the coercion below, and then silently dropped: a PUT of `filter_soft`
+    # answered 200 while the row still held its previous value.
+    from core.domains.instruments import symbol_extras as _symbol_extras
+
+    # ACCEPTED_KEYS is canonical + alias, so `chart_mode` reaches the same field as
+    # `tick_chart_mode` instead of being silently dropped after passing the guard.
+    _extra_updates = {
+        k: v for k, v in body.items() if k in _symbol_extras.ACCEPTED_KEYS
+    }
+    for _field in _symbol_extras.EXTRA_FIELDS:
+        # Also accept the raw MT5 wire name, which is what an MT5-style client and
+        # the `extra` blob itself use.
+        if _field.wire in body:
+            _extra_updates[_field.key] = body[_field.wire]
+        elif _field.key in (settings_dict or {}):
+            _extra_updates.setdefault(_field.key, settings_dict[_field.key])
+
+    if _extra_updates:
+        try:
+            extra, _applied = _symbol_extras.apply_updates(extra, _extra_updates)
+        except ValueError as exc:
+            # A value the field cannot hold must be a 400, not a row that stores
+            # something MT5 will refuse to read back.
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)
+            )
+
     model.mt5_extra = extra
 
     await symbol_repo.save_model(model)

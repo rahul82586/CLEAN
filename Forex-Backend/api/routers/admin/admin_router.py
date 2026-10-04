@@ -20,6 +20,8 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 
 from api.auth.admin_dependencies import verify_admin_api_key
+from core.domains.instruments import symbol_extras
+
 from api.di_providers import (
     get_account_repo,
     get_event_bus,
@@ -101,6 +103,9 @@ def _symbol_summary(symbol: Any) -> Dict[str, Any]:
     use. `mt5_tick_size` is MT5's separate TickSize field, which is frequently zero;
     the two differ on every symbol in the reference export.
     """
+    raw_extra = dict(getattr(symbol, "mt5_extra", None) or {})
+    drained_extra, _removed = symbol_extras.drain_legacy_template(raw_extra)
+
     return {
         "id": symbol.id,
         "name": symbol.name,
@@ -142,6 +147,30 @@ def _symbol_summary(symbol: Any) -> Dict[str, Any]:
         "swap_3day": symbol.swap_3day,
         "stops_level": getattr(symbol, "stops_level", 0),
         "freeze_level": getattr(symbol, "freeze_level", 0),
+        # Columns the Trade / Swaps / Options tabs read. Every one of these is
+        # accepted by the PUT and stored, but none was returned - so the editor
+        # could not show the value it had just saved. Read via getattr so a row
+        # predating a column reads as absent rather than raising.
+        "gtc_mode": getattr(symbol, "gtc_mode", None) and int(
+            getattr(getattr(symbol, "gtc_mode"), "value", getattr(symbol, "gtc_mode"))
+        ) if getattr(symbol, "gtc_mode", None) is not None else 0,
+        "swap_year_days": int(getattr(symbol, "swap_year_days", 0) or 0),
+        "trade_flags": int(
+            getattr(getattr(symbol, "trade_flags", 0), "value", getattr(symbol, "trade_flags", 0)) or 0
+        ),
+        "volume_limit": str(getattr(symbol, "volume_limit", 0)),
+        # MT5 SpreadBalance / SpreadDiff, already modelled but not surfaced.
+        "spread_balance": int(getattr(symbol, "spread_balance", 0) or 0),
+        "spread_diff": int(getattr(symbol, "spread_diff", 0) or 0),
+        "spread_diff_balance": int(getattr(symbol, "spread_diff_balance", 0) or 0),
+        # Options / Bonds - the tabs that appear for those calculation modes.
+        "option_mode": (
+            int(getattr(getattr(symbol, "option_mode", 0), "value",
+                        getattr(symbol, "option_mode", 0)) or 0)
+        ),
+        "strike_price": str(getattr(symbol, "strike_price", 0)),
+        "face_value": str(getattr(symbol, "face_value", 0)),
+        "face_value_currency": getattr(symbol, "face_value_currency", "") or "",
         "margin_initial": str(getattr(symbol, "margin_initial", "") or ""),
         "margin_maintenance": str(getattr(symbol, "margin_maintenance", "") or ""),
         "margin_hedged": str(getattr(symbol, "margin_hedged", 0)),
@@ -161,11 +190,29 @@ def _symbol_summary(symbol: Any) -> Dict[str, Any]:
             "maintenance_sell_limit": str(symbol.margin_rates.maintenance_sell_limit),
             "maintenance_buy_stop": str(symbol.margin_rates.maintenance_buy_stop),
             "maintenance_sell_stop": str(symbol.margin_rates.maintenance_sell_stop),
+            # MT5's grid is 8 order types x {initial, maintenance}. These two rows
+            # were neither writable nor returned, so a quarter of the Margin Rates
+            # tab could not be read or set.
+            "initial_buy_stop_limit": str(getattr(symbol.margin_rates, "initial_buy_stop_limit", 1)),
+            "initial_sell_stop_limit": str(getattr(symbol.margin_rates, "initial_sell_stop_limit", 1)),
+            "maintenance_buy_stop_limit": str(getattr(symbol.margin_rates, "maintenance_buy_stop_limit", 1)),
+            "maintenance_sell_stop_limit": str(getattr(symbol.margin_rates, "maintenance_sell_stop_limit", 1)),
         },
         "trade_sessions": len(symbol.trade_sessions or []),
         "is_trade_allowed": bool(symbol.is_trade_allowed),
-        "extra": getattr(symbol, "mt5_extra", {}) or {},
-        "settings_json": json.dumps(getattr(symbol, "mt5_extra", {}) or {}) if getattr(symbol, "mt5_extra", None) else None,
+        # The MT5 fields with no domain column, under their stable JSON keys
+        # (tick_flags, filter_soft, swap_rate_wednesday, ...). Read through the
+        # registry so the key names are declared in one place instead of being
+        # spelled out at each call site.
+        "fields": symbol_extras.read_values(raw_extra),
+        # The raw quarantine, for the export path and for round-trip inspection.
+        # The stale lowercase frontend template is DRAINED from this copy: measured
+        # on the live database, 25 of 25 sampled lowercase keys equalled
+        # DEFAULT_SYMBOL_DRAFT while the real server values sat unused under the wire
+        # names, and the editor rendered that template. Removing it here means an
+        # API consumer cannot read the fiction even by accident.
+        "extra": drained_extra,
+        "settings_json": json.dumps(drained_extra) if drained_extra else None,
     }
 
 
@@ -210,9 +257,16 @@ async def get_group(group_name: str, repo: Any = Depends(get_group_repo)) -> Dic
 
 @router.get("/symbols")
 async def list_symbols(repo: Any = Depends(get_symbol_repo)) -> List[Dict[str, Any]]:
-    """Every symbol, from the database."""
-    _require(repo, "symbol")
-    return [_symbol_summary(s) for s in await repo.get_all_symbols()]
+    """Every symbol.
+
+    Read from ConfigCache when available: `repo.get_all_symbols()` hydrates 362 ORM rows
+    of about 4 KB each and costs 214-336 ms against 0.59 ms of actual SQL. The cache holds
+    the identical domain Symbols and is kept current by the symbol CRUD events.
+    """
+    _require(repo, "symbol")
+    from api.routers.admin.reads import _symbols_for_read
+
+    return [_symbol_summary(s) for s in await _symbols_for_read(repo)]
 
 
 @router.get("/symbols/{symbol_name:path}")

@@ -192,7 +192,25 @@ class Symbol:
     
     # Flags
     is_trade_allowed: bool = True
-    
+
+    #: MT5 fields that have no domain attribute - tick filtration, the per-day swap
+    #: multiplier curve, the execution timeouts, the currency digits and the rest.
+    #: Stored under their exact MT5 wire names (``FilterSoft``, ``SwapRateWednesday``,
+    #: ...), because that is the key ``symbol_mt5_record`` overlays on export and the
+    #: name ``symbol_extras`` reads and writes.
+    #:
+    #: Declared on the entity so the Admin API can serve them. The serializer asks for
+    #: ``getattr(symbol, "mt5_extra", {})``; while this attribute did not exist the
+    #: lookup silently returned {} for every symbol, so 65 stored fields were invisible
+    #: and the symbol editor had nothing to render from.
+    mt5_extra: Dict[str, Any] = field(default_factory=dict)
+    #: The decimal scale each wire field arrived with, so a decode/encode round trip
+    #: stays byte-identical. Read-only: an MT5 import owns it.
+    mt5_scale: Dict[str, int] = field(default_factory=dict)
+    #: The complete original MT5 record, when the row was imported. This is the export
+    #: baseline. Read-only for the same reason.
+    mt5_source: Optional[Dict[str, Any]] = None
+
     # Metadata
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))

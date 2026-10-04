@@ -20,9 +20,18 @@ def upgrade() -> None:
     bind = op.get_bind()
     if bind.dialect.name != 'sqlite':
         op.create_foreign_key('fk_managers_group_name', 'managers', 'groups', ['group_name'], ['name'])
+    # managers.login is BigInteger and accounts.login is String(32), so a bare
+    # `accounts.login = managers.login` compares varchar to bigint - an operator
+    # PostgreSQL does not have, which fails the whole migration with
+    # "operator does not exist: character varying = bigint".
+    #
+    # The manager side is cast to text rather than the account side to bigint:
+    # accounts.login is already the string form, and casting a non-numeric
+    # managers.login to bigint would raise and turn a backfill into a hard failure.
     op.execute(
         "UPDATE managers SET group_name = ("
-        "  SELECT group_name FROM accounts WHERE accounts.login = managers.login"
+        "  SELECT group_name FROM accounts"
+        "  WHERE accounts.login = CAST(managers.login AS VARCHAR)"
         ") WHERE group_name IS NULL"
     )
 

@@ -232,6 +232,23 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
     // Active Quote
     const activeQuote = quotes[selectedSymbol.toUpperCase()] || { bid: 0, ask: 0, spread: 0 };
 
+    const tradableBlockReason: string | null = (() => {
+        const q: any = activeQuote;
+        if (!q) return null;                        // not loaded yet: stay enabled
+        if (q.marketState === 'closed') {
+            return 'The market for this symbol is closed. Orders cannot be placed.';
+        }
+        if (q.bid == null || q.ask == null) {
+            return 'No live price for this symbol, so an order cannot be priced.';
+        }
+        if (q.isTickStale) {
+            const limit = q.maxQuoteDelay ? ` (older than ${q.maxQuoteDelay}s)` : '';
+            return `The quote for this symbol is stale${limit}, so it cannot be traded.`;
+        }
+        return null;
+    })();
+    const orderBlocked = tradableBlockReason !== null;
+
     // Filtered Positions & Orders (only genuinely open positions & active pending orders)
     const displayedPositions = React.useMemo(() => {
         const active = positions.filter(p => !p.is_closed && !p.close_time && Number(p.volume) > 0);
@@ -264,7 +281,7 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
     // Quick Place Order Function
     const handlePlaceTrade = async (overrideType?: string) => {
         const finalOp = overrideType || orderType;
-        const isMarket = finalOp === 'buy' || finalOp === 'sell';
+    const isMarket = finalOp === 'buy' || finalOp === 'sell';
         setIsSubmitting(true);
 
         const payload: any = {
@@ -537,11 +554,12 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
                     <div className="tp-one-click-box">
                         <button
                             className="tp-btn-trade sell"
-                            disabled={isSubmitting}
+                            disabled={isSubmitting || orderBlocked}
+                            title={tradableBlockReason ?? 'Place a SELL order at market'}
                             onClick={() => handlePlaceTrade('sell')}
                         >
                             <span className="action">SELL</span>
-                            <span className="price">{activeQuote.bid > 0 ? activeQuote.bid.toFixed(2) : 'Market'}</span>
+                            <span className="price" style={orderBlocked ? { fontSize: 9 } : undefined}>{orderBlocked ? 'Closed' : (activeQuote.bid > 0 ? activeQuote.bid.toFixed(2) : 'Market')}</span>
                         </button>
 
                         <div className="tp-volume-box">
@@ -569,11 +587,12 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
 
                         <button
                             className="tp-btn-trade buy"
-                            disabled={isSubmitting}
+                            disabled={isSubmitting || orderBlocked}
+                            title={tradableBlockReason ?? 'Place a BUY order at market'}
                             onClick={() => handlePlaceTrade('buy')}
                         >
                             <span className="action">BUY</span>
-                            <span className="price">{activeQuote.ask > 0 ? activeQuote.ask.toFixed(2) : 'Market'}</span>
+                            <span className="price" style={orderBlocked ? { fontSize: 9 } : undefined}>{orderBlocked ? 'Closed' : (activeQuote.ask > 0 ? activeQuote.ask.toFixed(2) : 'Market')}</span>
                         </button>
                     </div>
 

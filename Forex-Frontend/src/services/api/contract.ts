@@ -13,7 +13,19 @@
  */
 import type { BackendGapError } from './errors';
 
-export type Ticks = Record<string, { bid: number; ask: number; age: number; spread?: number }>;
+export type Ticks = Record<string, {
+    /** null when the server has no price for the symbol - NEVER 0. */
+    bid: number;
+    ask: number;
+    age: number;
+    spread?: number;
+    /** Derived server-side from the symbol's real trading sessions. */
+    marketState?: 'open' | 'closed' | 'no_data';
+    isMarketOpen?: boolean;
+    /** Quote older than this symbol's own Max quote delay. */
+    isTickStale?: boolean;
+    maxQuoteDelay?: number;
+}>;
 
 /**
  * Trade-history request (doc §Orders/§Deals/§Positions "Requesting…"):
@@ -100,6 +112,13 @@ export interface TradeOperationView {
     /** editable field set, keys per kind (see OperationDialog) */
     details: Record<string, any>;
     ticks: Array<{ time: string; bid: number; ask: number; last: number }>;
+    /**
+     * Why `ticks` is empty, when it is. Tick history is NOT stored on this server
+     * (GET /api/v1/admin/history/ticks returns 501 NOT WIRED; /TickHistory returns
+     * 0 rows), so the operation view must be able to say so instead of drawing a
+     * chart from generated prices.
+     */
+    ticks_unavailable?: string;
     journal: Array<{ time: string; server: string; message: string }>;
 }
 
@@ -151,6 +170,15 @@ export interface AdminApi {
     // Symbols
     getSymbols(): Promise<any[]>;
     getSymbolDetail(symbol: string): Promise<any>;
+    /**
+     * The MT5 ConfigSymbols field descriptors the Symbol editor renders FROM.
+     * `enum_values` is expanded from the domain enums server-side.
+     */
+    getSymbolSchema(): Promise<any>;
+    /** The symbol's stored trade/quote calendar (MT5 SessionsQuotes/SessionsTrades). */
+    getSymbolSessions(symbol: string): Promise<any>;
+    /** The symbol's column-less MT5 fields, keyed by their stable JSON names. */
+    getSymbolFields(symbol: string): Promise<any>;
     createSymbol(data: any): Promise<any>;
     updateSymbol(symbol: string, data: any): Promise<any>;
     deleteSymbol(symbol: string): Promise<any>;

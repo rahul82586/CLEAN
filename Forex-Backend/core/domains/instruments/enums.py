@@ -170,3 +170,140 @@ class HolidayMode(Enum):
 
     DISABLED = 0
     ENABLED = 1
+# ---------------------------------------------------------------------------
+# Bitmask / enum fields surfaced by the symbol editor
+# (Common / Quotes / Trade / Execution / Margin / Swaps tabs)
+#
+# Every value below is transcribed from the SDK's
+# IMTConSymbol/Enumerations.md, not inferred from the member names -- the same
+# rule this module's header states, and the same mistake it warns about.
+#
+# NAMING: MT5 reuses the name TradeFlags for two unrelated bitmasks. The GROUP
+# one (accounts.enums.TradeFlags, TRADEFLAGS_*) is a different field with
+# different values (0x1F, 0x400...). Ours is therefore SymbolTradeFlags, and
+# nothing here shadows the group enum: get_field_schema expands enum names
+# across BOTH modules, so a collision would make the group schema silently
+# expand the wrong member list.
+# ---------------------------------------------------------------------------
+
+
+class SymbolTickFlags(IntFlag):
+    """IMTConSymbol::EnTickFlags - the Quotes tab's four switches.
+
+    This is the field the Quotes tab is really made of. The previous UI read a
+    stale lowercase template out of mt5_extra instead of this, so every tick
+    filtration switch shown to an operator was a frontend default rather than
+    the value the trade server actually holds.
+
+    Note TICK_ALL is 7, i.e. REALTIME|COLLECTRAW|FEED_STATS -- the SDK does NOT
+    include TICK_NEGATIVE_PRICES in ALL, because negative prices are only legal
+    for futures. Defining ALL as 15 would silently let negative prices through
+    on every instrument.
+    """
+
+    NONE = 0             # TICK_NONE
+    REALTIME = 1         # TICK_REALTIME        allow real-time quotes from data feeds
+    COLLECTRAW = 2       # TICK_COLLECTRAW      save raw, unfiltered ticks
+    FEED_STATS = 4       # TICK_FEED_STATS      receive market statistics from data feeds
+    NEGATIVE_PRICES = 8  # TICK_NEGATIVE_PRICES futures only
+    ALL = 7              # TICK_ALL
+
+
+class SymbolMarginFlags(IntFlag):
+    """IMTConSymbol::EnMarginFlags - the Margin tab's additional margin checks."""
+
+    NONE = 0x0000000           # MARGIN_FLAGS_NONE
+    CHECK_PROCESS = 0x0000001  # check before executing orders
+    CHECK_SLTP = 0x0000002     # check on SL-TP trigger
+
+
+class SymbolSwapFlags(IntFlag):
+    """IMTConSymbol::EnSwapFlags - the Swaps tab's holiday handling."""
+
+    NONE = 0               # SWAP_FLAGS_NONE
+    CONSIDER_HOLIDAYS = 1  # SWAP_FLAGS_CONSIDER_HOLIDAYS
+
+
+class SymbolRequestFlags(IntFlag):
+    """IMTConSymbol::EnRequestFlags - Request execution mode."""
+
+    NONE = 0   # REQUEST_FLAGS_NONE
+    ORDER = 1  # REQUEST_FLAGS_ORDER  additional confirmation mode
+
+
+class SymbolInstantFlags(IntFlag):
+    """IMTConSymbol::EnInstantFlags - Instant execution mode."""
+
+    NONE = 0               # INSTANT_FLAGS_NONE
+    FAST_CONFIRMATION = 1  # INSTANT_FLAGS_FAST_CONFIRMATION
+
+
+class SymbolTradeFlags(IntFlag):
+    """IMTConSymbol::EnTradeFlags - the Trade tab's two switches.
+
+    Distinct from accounts.enums.TradeFlags, which is the GROUP bitmask. Values
+    in the reference export are 0 or 2 (ETHUSD carries 2 = signals on).
+    """
+
+    NONE = 0              # TRADE_FLAGS_NONE
+    PROFIT_BY_MARKET = 1  # TRADE_FLAGS_PROFIT_BY_MARKET (Forex symbols only)
+    ALLOW_SIGNALS = 2     # TRADE_FLAGS_ALLOW_SIGNALS
+    ALL = 3               # TRADE_FLAGS_ALL
+
+
+class SymbolSwapDays(Enum):
+    """IMTConSymbol::EnSwapDays - which weekday carries the triple swap.
+
+    Sunday-first, matching the MT5 wire. DISABLED (7) turns triple swaps off.
+    The symbol column swap_3day defaults to 3 = WEDNESDAY, the market convention
+    and what the reference export carries.
+    """
+
+    SUNDAY = 0
+    MONDAY = 1
+    TUESDAY = 2
+    WEDNESDAY = 3
+    THURSDAY = 4
+    FRIDAY = 5
+    SATURDAY = 6
+    DISABLED = 7
+
+
+class SymbolChartMode(Enum):
+    """IMTConSymbol::EnChartMode - the Common tab's chart mode.
+
+    OLD = 255 is a service value the SDK documents as "for internal use". It is
+    kept so a round trip of a legacy server value need not invent a member, but
+    it is not offered as a choice in the UI.
+    """
+
+    BID_PRICE = 0   # CHART_MODE_BID_PRICE
+    LAST_PRICE = 1  # CHART_MODE_LAST_PRICE
+    OLD = 255       # CHART_MODE_OLD
+
+
+class SymbolSpliceType(Enum):
+    """IMTConSymbol::EnSpliceType - how futures contract quotes are spliced."""
+
+    NONE = 0        # SPLICE_NONE
+    UNADJUSTED = 1  # SPLICE_UNADJUSTED
+    ADJUSTED = 2    # SPLICE_ADJUSTED
+
+
+class MarginRateType(Enum):
+    """IMTConSymbol::EnMarginRateTypes - the eight Margin Rates tab rows, in the
+    order MT5 presents them.
+
+    The tab is a grid: these eight order types down the side and Initial /
+    Maintenance across. The order IS the tab's layout, so it is declared here
+    rather than left to whichever order a dict happened to be built in.
+    """
+
+    BUY = 0              # MARGIN_RATE_BUY
+    SELL = 1             # MARGIN_RATE_SELL
+    BUY_LIMIT = 2        # MARGIN_RATE_BUY_LIMIT
+    SELL_LIMIT = 3       # MARGIN_RATE_SELL_LIMIT
+    BUY_STOP = 4         # MARGIN_RATE_BUY_STOP
+    SELL_STOP = 5        # MARGIN_RATE_SELL_STOP
+    BUY_STOP_LIMIT = 6   # MARGIN_RATE_BUY_STOP_LIMIT
+    SELL_STOP_LIMIT = 7  # MARGIN_RATE_SELL_STOP_LIMIT
