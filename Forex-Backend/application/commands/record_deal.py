@@ -23,6 +23,48 @@ from core.domains.market_data.feed_access import await_tick, tick_bid, tick_ask
 logger = logging.getLogger(__name__)
 
 
+
+
+async def _open_pendings_for_margin(account_login: Any) -> list:
+    """Open pending orders for the margin engine, or [] when they cannot be read.
+
+    R3: the engine can only cost pending orders if it is HANDED them, and nothing passed
+    them - so `margin_used` excluded every working order and `margin_level` was overstated.
+
+    `[]` on any failure reproduces the previous positions-only figure. That is the safe
+    degradation: it never invents exposure and never crashes the valuation.
+    """
+    try:
+        from api.di_providers import get_order_repo
+
+        repo = get_order_repo()
+    except Exception:  # noqa: BLE001
+        return []
+    if repo is None:
+        return []
+    for name in ("find_pending_orders", "get_open_orders", "get_pending_orders"):
+        getter = getattr(repo, name, None)
+        if getter is None:
+            continue
+        try:
+            result = getter(str(account_login))
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "could not list pending orders for %s via %s: %s", account_login, name, exc
+            )
+            return []
+        out = []
+        for order in (result or []):
+            try:
+                if getattr(order, "is_pending", None):
+                    out.append(order)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+    return []
+
 @dataclass
 class RecordDealCommand:
     """
@@ -665,6 +707,60 @@ class RecordDealHandler:
                 )
             )
 
+        # --- R3: working orders contribute margin here too -----------------
+        #
+        # This is the path EVERY fill takes, and it wrote `margin_used` from positions
+        # alone. A resting pending therefore contributed nothing to the figure the
+        # stop-out logic reads, so margin call and stop-out could never be triggered by
+        # pending exposure - which is how MT5 treats it: working orders are in Margin and
+        # in the margin level.
+        #
+        # Costed at the INITIAL rate regardless of `maintenance`, per MT5: "For pending
+        # orders, the initial margin is always checked."
+        for _order in await _open_pendings_for_margin(account.login):
+            try:
+                _sym_name = str(getattr(_order, "symbol", "") or "")
+                if not _sym_name:
+                    continue
+                _vol = getattr(_order, "volume_current", None)
+                _vol_val = getattr(_vol, "value", _vol)
+                if _vol_val is None:
+                    continue
+                _vol_val = Decimal(str(_vol_val))
+                if _vol_val <= 0:
+                    continue
+                _symbol = await self.symbol_repo.find_by_name(_sym_name)
+                if not _symbol:
+                    logger.error(
+                        "pending order %s is in unconfigured symbol %s; it cannot be "
+                        "margined",
+                        getattr(_order, "ticket_id", "?"), _sym_name,
+                    )
+                    continue
+                _spec = SymbolMarginSpec.from_symbol(_symbol)
+                specs[_sym_name] = _spec
+                _otype = getattr(_order, "order_type", None)
+                _op = str(getattr(_otype, "value", _otype) or "")
+                _price = getattr(getattr(_order, "price_order", None), "value", None)
+                if not _op or _price is None:
+                    continue
+                legs.append(
+                    Leg(
+                        symbol=_sym_name,
+                        operation=_op,
+                        volume=_vol_val,
+                        price=Decimal(str(_price)),
+                        is_pending=True,
+                        spec=_spec,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Never silently drop a pending: dropping it is the defect being fixed.
+                logger.error(
+                    "could not include pending order %s in the post-deal margin: %s",
+                    getattr(_order, "ticket_id", "?"), exc,
+                )
+
         if legs:
             breakdown = calculate_account_margin(
                 legs,
@@ -686,8 +782,12 @@ class RecordDealHandler:
         # client trading on credit was stopped out early.
         equity = account.balance.amount + account.credit.amount + unrealized
         account.margin_used = Money(total_margin_used, currency)
-        account.margin_free = Money(equity - total_margin_used, currency)
         account.equity = Money(equity, currency)
+        # R15 consolidation: the group's FreeMarginMode decides free margin, and that
+        # ladder has ONE home on the entity. This wrote `equity - margin_used` by hand,
+        # which is only correct for USE_PL - on a group set to NOT_USE_PL / PROFIT /
+        # LOSS the figure disagreed with what `update_equity` produces.
+        account.recompute_free_margin()
         # D1: margin_level is a PERSISTED column with three readers - the MT5
         # routing context (RouteCondition.MARGIN_LEVEL), /account/info and the
         # manager UserGet. Every other margin write path refreshes it; this one,

@@ -19,6 +19,7 @@ from decimal import Decimal
 from typing import Optional
 
 from core.domains.accounts.account import Account
+from application.services.margin_reservation import release_margin
 from core.domains.common.value_objects import Money
 from core.domains.oms.entities.order import Order
 from core.domains.oms.enums import OrderState, OrderType
@@ -76,43 +77,43 @@ class CancelOrderHandler:
                 f"Order is already {order.state.value}."
             )
 
-        # 4. Calculate reserved margin to release
-        # (Only for pending orders that had margin reserved)
+        # 4. Read the reservation that was ACTUALLY placed.
+        #
+        # This used to RECOMPUTE the hold as
+        #     price_order * unfilled_volume * contract_size / 100
+        # - a hardcoded leverage of 100, and the CFD price term applied to every calc
+        # mode, with no margin rate and no currency conversion. The amount was already
+        # recorded EXACTLY, on the order, when risk_service approved it. Re-deriving it
+        # is what made the release wrong in the first place.
         reserved_margin = Decimal('0')
         if order.state in [OrderState.PLACED, OrderState.PARTIALLY_FILLED]:
-            # Calculate how much margin was reserved for unfilled portion
-            unfilled_volume = order.volume_current.value
-            if unfilled_volume > Decimal('0'):
-                # Simplified: use price_order * contract_size / leverage
-                # In production, this should match the original reservation logic
-                reserved_margin = (
-                    order.price_order.value *
-                    unfilled_volume *
-                    order.contract_size
-                ) / Decimal(str(100))  # Simplified leverage
+            reserved_margin = Decimal(str(getattr(order, 'reserved_margin', 0) or 0))
 
         # 5. Cancel the order (inside per-account lock)
         async with self.risk_service.account_lock(command.account_login):
             # Transition state
             order.cancel(reason=command.reason or "Client cancellation")
 
-            # Release reserved margin
+            # Release the reservation through the ONE release path.
+            #
+            # The old code edited margin_used / margin_free in Python and saved the whole
+            # row. It never touched accounts.margin_reserved - the column the reservation
+            # actually lives in - so the hold survived the cancel forever, and
+            # reserve_margin's SQL condition subtracts margin_reserved from availability,
+            # so the client's free margin shrank permanently: no expiry, no alert.
+            #
+            # release_margin prefers the repository's atomic conditional UPDATE, which two
+            # concurrent releases cannot both satisfy.
             if reserved_margin > Decimal('0'):
                 account = await self.account_repo.find_by_login(command.account_login)
-                if account:
-                    account.margin_used = Money(
-                        max(account.margin_used.amount - reserved_margin, Decimal('0')),
-                        account.currency
-                    )
-                    account.margin_free = Money(
-                        account.margin_free.amount + reserved_margin,
-                        account.currency
-                    )
-                    if account.margin_used.amount > Decimal('0'):
-                        account.recompute_margin_level()
-                    else:
-                        account.margin_level = Decimal('999999')
-                    await self.account_repo.save(account)
+                await release_margin(
+                    self.account_repo,
+                    command.account_login,
+                    reserved_margin,
+                    account=account,
+                )
+                # The hold is released; the order holds nothing any more.
+                order.reserved_margin = Decimal('0')
 
             # Persist order
             saved_order = await self.order_repo.save(order)

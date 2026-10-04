@@ -78,9 +78,15 @@ from core.domains.instruments.symbol import Symbol
 from core.domains.instruments.value_objects import MarginRates, QuoteSession, TradingSession
 
 from infrastructure.mt5 import enums as mt5enums
+
+from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
 from infrastructure.mt5 import fieldmap
 from infrastructure.mt5.codec import EXTRA_KEY, SCALE_KEY, record_to_domain
 from infrastructure.mt5.wire import WEEKDAY_SUNDAY_FIRST, decode_file, records
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
 
 
 class ConfigError(ValueError):
@@ -278,10 +284,12 @@ def parse_margin_profile(raw: Any, where: str) -> MarginProfile:
     return MarginProfile(
         mode=_enum(MarginMode, raw.get("mode"), f"{where}.margin", "mode", MarginMode.RETAIL),
         margin_call_level=_percent(
-            raw.get("margin_call_level", 50), f"{where}.margin", "margin_call_level"
+            raw.get("margin_call_level", DEFAULT_MARGIN_CALL_LEVEL), f"{where}.margin",
+            "margin_call_level"
         ),
         stop_out_level=_percent(
-            raw.get("stop_out_level", 30), f"{where}.margin", "stop_out_level"
+            raw.get("stop_out_level", DEFAULT_STOP_OUT_LEVEL), f"{where}.margin",
+            "stop_out_level"
         ),
         stop_out_mode=_enum(
             StopOutMode,
@@ -921,8 +929,8 @@ def group_from_mt5_record(
             mode=mt5enums.MARGIN_MODE_FROM_MT5.get(
                 _int(margin.get("mode"), "mt5", "MarginMode", 0), MarginMode.RETAIL
             ),
-            margin_call_level=margin.get("margin_call_level") or Decimal(50),
-            stop_out_level=margin.get("stop_out_level") or Decimal(30),
+            margin_call_level=margin.get("margin_call_level") or DEFAULT_MARGIN_CALL_LEVEL,
+            stop_out_level=margin.get("stop_out_level") or DEFAULT_STOP_OUT_LEVEL,
             stop_out_mode=mt5enums.STOP_OUT_MODE_FROM_MT5.get(
                 _int(margin.get("stop_out_mode"), "mt5", "MarginSOMode", 0),
                 StopOutMode.PERCENT,

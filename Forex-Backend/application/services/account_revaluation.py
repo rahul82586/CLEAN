@@ -9,6 +9,73 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+
+
+
+
+def _free_margin_via_entity(account, equity_amount, margin_used) -> Decimal:
+    """Free margin for a computed equity/margin pair, via the entity's own rule.
+
+    R15: the entity owns the FreeMarginMode ladder. Rather than re-deriving
+    `equity - margin_used` here - which is only the USE_PL case - a shallow copy
+    carries the two computed values and the entity answers.
+    """
+    import copy
+
+    try:
+        probe = copy.copy(account)
+        probe.equity = Money(equity_amount, getattr(account, "currency", "USD"))
+        probe.margin_used = Money(margin_used, getattr(account, "currency", "USD"))
+        probe.recompute_free_margin()
+        return probe.margin_free.amount
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "could not apply the group free-margin rule (%s); using the USE_PL "
+            "fallback",
+            exc,
+        )
+        return equity_amount - margin_used
+
+async def _open_pendings_for_margin(account_login: Any) -> list:
+    """Open pending orders for the margin engine, or [] when they cannot be read.
+
+    R3: the engine can only cost pending orders if it is HANDED them, and nothing passed
+    them - so `margin_used` excluded every working order and `margin_level` was overstated.
+
+    `[]` on any failure reproduces the previous positions-only figure. That is the safe
+    degradation: it never invents exposure and never crashes the valuation.
+    """
+    try:
+        from api.di_providers import get_order_repo
+
+        repo = get_order_repo()
+    except Exception:  # noqa: BLE001
+        return []
+    if repo is None:
+        return []
+    for name in ("find_pending_orders", "get_open_orders", "get_pending_orders"):
+        getter = getattr(repo, name, None)
+        if getter is None:
+            continue
+        try:
+            result = getter(str(account_login))
+            if hasattr(result, "__await__"):
+                result = await result
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "could not list pending orders for %s via %s: %s", account_login, name, exc
+            )
+            return []
+        out = []
+        for order in (result or []):
+            try:
+                if getattr(order, "is_pending", None):
+                    out.append(order)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+    return []
+
 async def get_live_quotes_map(symbols: List[str]) -> Dict[str, Dict[str, str]]:
     """Helper to fetch live quotes from market data feed/cache if available."""
     try:
@@ -50,7 +117,9 @@ def compute_trading_state(
             "equity": str(equity_amt),
             "margin_used": "0.00",
             "margin_free": str(equity_amt),
-            "margin_level": "0.00",
+            # R15: a flat account is UNLIMITED, not exhausted. 0 is below every stop-out
+          # threshold and would read as a stop-out candidate.
+          "margin_level": str(_MARGIN_LEVEL_UNLIMITED),
             "currency": currency,
         }
 
@@ -96,8 +165,20 @@ def compute_trading_state(
         total_margin += margin_req
 
     equity_amt = balance_amt + credit_amt + total_profit
-    margin_free_amt = max(Decimal("0.00"), equity_amt - total_margin)
-    margin_level_amt = (equity_amt / total_margin * Decimal("100.0")) if total_margin > Decimal("0") else Decimal("0.00")
+    # R15 consolidation: the entity owns the FreeMarginMode ladder, so the rule is
+    # applied through it rather than re-derived here. NOTE the old `max(0, ...)` clamp
+    # is deliberately NOT carried over: negative free margin is meaningful - it is how a
+    # margin call is expressed - and clamping it made an account look healthier than it
+    # was.
+    from core.domains.accounts.account import Account as _Account
+
+    margin_free_amt = _free_margin_via_entity(acc, equity_amt, total_margin)
+    # R15: the SENTINEL, not 0. A level of 0 sits below every stop-out threshold,
+    # so a flat account read as fully exhausted - the failure the sentinel exists
+    # to prevent. `margin_level()` is the shared pure function.
+    from core.domains.market_data.margin import margin_level as _margin_level
+    
+    margin_level_amt = _margin_level(equity_amt, total_margin)
 
     return {
         "balance": str(balance_amt),
@@ -165,9 +246,16 @@ async def revalue_account(
 
     currency = getattr(acc, "currency", "USD") or "USD"
 
-    if risk_engine is not None and open_positions:
+    # R3: fetch working orders and run the engine when EITHER is present. The old guard
+    # `and open_positions` meant an account resting pending orders and holding no position
+    # never had the engine run at all, so its pending exposure was invisible twice over:
+    # absent from the legs AND absent from this trigger.
+    _pendings = await _open_pendings_for_margin(acc.login)
+    if risk_engine is not None and (open_positions or _pendings):
         try:
-            snapshot = risk_engine.calculate_margin_level(acc, open_positions)
+            snapshot = risk_engine.calculate_margin_level(
+                acc, open_positions, _pendings
+            )
             acc.margin_used = Money(snapshot.margin_used, currency)
             acc.equity = Money(snapshot.equity, currency)
             acc.profit = Money(snapshot.equity - (acc.balance.amount + acc.credit.amount), currency)
@@ -203,9 +291,16 @@ async def revalue_account(
     # rate -> per-symbol netting/hedged aggregation). Use it, and keep the local
     # computation only for the fields it does not own (profit/equity).
     engine_ran = False
-    if risk_engine is not None and open_positions:
+    # R3: same widening as the primary write. The manager terminal must show the
+    # margin level that INCLUDES working orders, or it disagrees with the stop-out
+    # path that does include them - and an operator sees a healthier account than
+    # exists.
+    _pendings_state = await _open_pendings_for_margin(getattr(acc, "login", None))
+    if risk_engine is not None and (open_positions or _pendings_state):
         try:
-            snapshot = risk_engine.calculate_margin_level(acc, open_positions)
+            snapshot = risk_engine.calculate_margin_level(
+                acc, open_positions, _pendings_state
+            )
             state["margin_used"] = str(snapshot.margin_used)
             state["margin_free"] = str(snapshot.margin_free)
             state["margin_level"] = str(snapshot.margin_level)

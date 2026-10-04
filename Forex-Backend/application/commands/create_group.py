@@ -32,6 +32,12 @@ from core.events.domain_events import GroupCreated
 from core.ports.interfaces import IGroupRepository, IEventBus
 from application.cache.config_cache import get_config_cache
 
+from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -52,8 +58,8 @@ class CreateGroupCommand:
     currency: str = "USD"
     leverage_default: int = 100
     leverage_max: int = 500
-    margin_call_level: Decimal = Decimal('80')   # percent, MT5 convention
-    stop_out_level: Decimal = Decimal('50')      # percent, MT5 convention
+    margin_call_level: Decimal = DEFAULT_MARGIN_CALL_LEVEL  # R11   # percent, MT5 convention
+    stop_out_level: Decimal = DEFAULT_STOP_OUT_LEVEL  # R11      # percent, MT5 convention
     trade_allowed: bool = True
 
 

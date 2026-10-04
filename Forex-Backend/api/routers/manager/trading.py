@@ -293,7 +293,9 @@ async def recalculate_account_trading_state(
         acc.profit = Money(total_profit, currency)
         acc.equity = Money(acc.balance.amount + acc.credit.amount + total_profit, currency)
         acc.margin_used = Money(total_margin, currency)
-        acc.margin_free = Money(max(Decimal("0.00"), acc.equity.amount - total_margin), currency)
+        # R15 consolidation: one free-margin rule, on the entity, honouring the group's
+        # FreeMarginMode. This wrote `max(0, equity - margin)` by hand.
+        acc.recompute_free_margin()
         acc.recompute_margin_level()
         await account_repo.save(acc)
     except Exception as exc:
@@ -985,6 +987,24 @@ async def handle_PositionModify_get(
     )
 
 
+#: Set once, so a degraded manager gate is announced once per process rather than on
+#: every order. Silent degradation is what let R6 go unnoticed for so long.
+_MANAGER_GATE_DEGRADED_LOGGED = False
+
+
+def _log_manager_gate_degraded() -> None:
+    """Announce, once, that the manager gate runs WITHOUT the book."""
+    global _MANAGER_GATE_DEGRADED_LOGGED
+    if _MANAGER_GATE_DEGRADED_LOGGED:
+        return
+    _MANAGER_GATE_DEGRADED_LOGGED = True
+    logger.error(
+        "manager risk gate is DEGRADED: no registered PreTradeRiskService, so the "
+        "shared per-account lock, the live margin snapshot and the group "
+        "order/position/volume limits are NOT enforceable on manager orders"
+    )
+
+
 async def _enforce_manager_risk_gates(
     *,
     target_symbol: str,
@@ -1030,11 +1050,62 @@ async def _enforce_manager_risk_gates(
             detail=f"Trade rejected: unknown account {target_login}",
         )
 
-    service = PreTradeRiskService(
-        risk_engine=get_risk_engine(),
-        symbol_repo=symbol_repo,
-        account_repo=account_repo,
-    )
+    # R6: use the CONTAINER'S service, not a fresh one.
+    #
+    # A per-request service carries its OWN `_account_locks` dict, so it serialises against
+    # nobody and a manager order can interleave with a client order on the same account. It
+    # also had no `position_repo`, so the live margin snapshot and the group
+    # order/position/volume limits could not see the book, and no `order_repo`, so MT5's
+    # `LimitOrders` fell back to counting positions instead of working orders.
+    #
+    # The registered instance is already in the container, so the manager path now shares
+    # the SAME service, lock and repositories as the client path. `Manager obeys the same
+    # gates as a client` was already this project's decision; this makes it true of the
+    # instance and not merely of the rules.
+    service = None
+    try:
+        from api.di_providers import get_di_container
+
+        container = get_di_container()
+        if container is not None:
+            service = container.resolve(PreTradeRiskService)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "manager risk gate: could not resolve the registered PreTradeRiskService "
+            "(%s); building a local one, which has NO shared account lock, NO position "
+            "repository and NO order repository",
+            exc,
+        )
+        service = None
+
+    if service is None:
+        # Announced once per process. A silent degradation is what hid this defect for so
+        # long: the gates ran, so the path LOOKED guarded while it could not see the book.
+        _log_manager_gate_degraded()
+        service = PreTradeRiskService(
+            risk_engine=get_risk_engine(),
+            symbol_repo=symbol_repo,
+            account_repo=account_repo,
+        )
+
+    # Whatever service we have, make sure the gates can see the book and count orders.
+    # A registered service already has these; a locally built one does not.
+    if getattr(service, "position_repo", None) is None:
+        try:
+            from api.di_providers import get_di_container
+            from core.ports.interfaces import IPositionRepository
+
+            service.position_repo = get_di_container().resolve(IPositionRepository)
+        except Exception:  # noqa: BLE001
+            pass
+    if getattr(service, "order_repo", None) is None:
+        try:
+            from api.di_providers import get_di_container
+            from core.ports.interfaces import IOrderRepository
+
+            service.order_repo = get_di_container().resolve(IOrderRepository)
+        except Exception:  # noqa: BLE001
+            pass
 
     # Direction lives in the ORDER TYPE - the entity has no `side` field, matching MT5.
     is_buy = str(operation).upper().startswith("B")
@@ -1061,6 +1132,20 @@ async def _enforce_manager_risk_gates(
         publish_events=False,
     )
     if approved:
+        # R6: the gate reserved margin on THIS throwaway order, which is discarded
+        # when this helper returns. `risk_service` sets `order.reserved_margin`
+        # and it was never transferred or released - one of the three leaks in R5.
+        #
+        # Released here rather than skipped, so the hold still exists DURING the
+        # gate: a concurrent client order sees it while the check runs, which is the
+        # property the reservation exists for. Between this release and the row being
+        # written there is no hold; a dealer action is manual rather than high-frequency,
+        # and a guaranteed leak is the worse of the two.
+        hold = getattr(order, "reserved_margin", None) or _Decimal("0")
+        if hold > _Decimal("0"):
+            from application.services.margin_reservation import release_margin
+            await release_margin(account_repo, target_login, hold, account=account)
+            order.reserved_margin = _Decimal("0")
         return
 
     reason = getattr(service, "last_rejection_reason", None) or "pre-trade risk check failed"

@@ -4,8 +4,11 @@ Client Authentication Dependencies for FastAPI.
 Injects current authenticated client user account into protected endpoints via OAuth2 Bearer token,
 enforcing token revocation blacklist checks and rate limits.
 """
+import logging
 from decimal import Decimal
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 from fastapi import Depends, HTTPException, status, Request
 from fastapi.security import OAuth2PasswordBearer
 
@@ -33,40 +36,70 @@ async def get_current_user(
 
     if token_blacklist:
         try:
-            if await token_blacklist.is_blacklisted(token):
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail="Token has been revoked",
-                    headers={"WWW-Authenticate": "Bearer"},
-                )
-        except Exception:
-            pass
+            revoked = await token_blacklist.is_blacklisted(token)
+        except Exception as exc:  # noqa: BLE001
+            # Fail CLOSED. This was `except Exception: pass`, so a revoked token was
+            # accepted precisely when the blacklist was unreachable - the only moment the
+            # check matters. A revocation list that cannot be read is not permission to
+            # ignore revocation.
+            logger.error("token blacklist unreachable, refusing the request: %s", exc)
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Token revocation status unavailable; request refused",
+            )
+        if revoked:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Token has been revoked",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
 
     try:
         payload = verify_token(token)
-        login_id: str = str(payload.get("sub", "100001"))
     except Exception:
         raise credentials_exception
 
-    account = None
-    if account_repo:
-        try:
-            account = await account_repo.find_by_login(int(login_id) if login_id.isdigit() else login_id)
-        except Exception:
-            account = None
+    # NO DEFAULT. This was `payload.get("sub", "100001")`, so a token carrying no subject
+    # silently became account 100001 - a login that does not exist in this database at all.
+    # An absent subject is a malformed token, which is a 401.
+    raw_subject = payload.get("sub")
+    if raw_subject is None or str(raw_subject).strip() == "":
+        raise credentials_exception
+    login_id = str(raw_subject).strip()
+
+    if account_repo is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account lookup unavailable; request refused",
+        )
+
+    try:
+        account = await account_repo.find_by_login(
+            int(login_id) if login_id.isdigit() else login_id
+        )
+    except Exception as exc:  # noqa: BLE001
+        # An OUTAGE is not "no such account". Both refuse, but they are different failures
+        # and an operator must be able to tell which is happening. This was swallowed into
+        # `account = None`, which then produced a FUNDED trading account - so a database
+        # outage granted trading rights.
+        logger.error("account lookup failed for %s: %s", login_id, exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Account lookup unavailable; request refused",
+        )
 
     if account is None:
-        login_num = int(login_id) if login_id.isdigit() else 100001
-        account = Account(
-            login=login_num,
-            client_id=f"CLIENT_{login_num}",
-            account_type=AccountType.REAL,
-            currency="USD",
-            balance=Money(Decimal('10000.00'), "USD"),
-            equity=Money(Decimal('10000.00'), "USD"),
-            margin_used=Money(Decimal('0'), "USD"),
-            margin_free=Money(Decimal('10000.00'), "USD"),
-            margin_level=Decimal('999999'),
+        # An unknown login is refused. This used to return an Account holding 10,000 USD
+        # with margin level 999999 and NO GROUP - and with no group,
+        # `Account.evaluate_margin_state()` returns an empty list, so that account could
+        # never be margin-called or stopped out. An identity that cannot be loaded is not a
+        # licence to trade.
+        raise credentials_exception
+
+    if not getattr(account, "is_enabled", True):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Account is disabled",
         )
 
     return account

@@ -181,4 +181,4 @@ class SqlOrderRepository(IOrderRepository[Order]):
                 await session.delete(model)
                 await session.commit()
                 return True
-            return False
+            return False

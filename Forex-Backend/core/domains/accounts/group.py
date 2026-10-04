@@ -2,6 +2,9 @@
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
+
+#: Shared zero, matching `core.domains.market_data.margin.ZERO`.
+ZERO = Decimal("0")
 from typing import Any, Dict, List, Optional
 import uuid
 
@@ -151,73 +154,23 @@ class Group:
     updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     is_active: bool = True
     
-    def get_symbol_config(self, symbol_name: str) -> Dict[str, Any]:
-        """Get effective symbol configuration for this Group."""
-        config = {}
-        for override in self.symbol_overrides:
-            if self._matches_symbol_pattern(symbol_name, override.symbol_pattern):
-                if override.trade_mode is not None:
-                    config['trade_mode'] = override.trade_mode
-                if override.execution_mode is not None:
-                    config['execution_mode'] = override.execution_mode
-                if override.volume_min is not None:
-                    config['volume_min'] = override.volume_min
-                if override.volume_max is not None:
-                    config['volume_max'] = override.volume_max
-                if override.volume_limit is not None:
-                    config['volume_limit'] = override.volume_limit
-                if override.spread_diff is not None:
-                    config['spread_diff'] = override.spread_diff
-                if override.margin_rate_initial_buy is not None:
-                    config['margin_rate_initial_buy'] = override.margin_rate_initial_buy
-                if override.margin_rate_initial_sell is not None:
-                    config['margin_rate_initial_sell'] = override.margin_rate_initial_sell
-                if override.swap_long is not None:
-                    config['swap_long'] = override.swap_long
-                if override.swap_short is not None:
-                    config['swap_short'] = override.swap_short
-                break
-        return config
-    
-    def _matches_symbol_pattern(self, symbol: str, pattern: str) -> bool:
-        """Check if symbol matches pattern (supports wildcards)."""
-        if pattern.endswith("*"):
-            prefix = pattern[:-1]
-            return symbol.startswith(prefix)
-        return symbol == pattern
-    
-    def is_symbol_allowed(self, symbol: str) -> bool:
-        """Check if a symbol is allowed for this group."""
-        allowed = self.permissions.allowed_symbols
-        if "*" in allowed:
-            return True
-        for pattern in allowed:
-            if pattern.endswith("*"):
-                prefix = pattern[:-1]
-                if symbol.startswith(prefix):
-                    return True
-            elif symbol == pattern:
-                return True
-        return False
-    
-    # ------------------------------------------------------------------
-    # Margin spec memoisation
-    # ------------------------------------------------------------------
-    #
-    # Building a SymbolMarginSpec from the caller's dict costs more than the margin
-    # arithmetic itself (profiled: 0.429s per 20k calls, of which basic_margin is only
-    # 0.064s). Symbol configuration does not change between calls in the normal case -
-    # changing it is an admin operation that invalidates ConfigCache - so the work is
-    # pure repetition on the pre-trade hot path.
-    #
-    # Keyed on id(symbol_config), with the dict itself held in the entry so its id cannot
-    # be recycled while the entry lives. Bounded, so a caller that builds a fresh dict per
-    # call cannot grow it without limit.
-
-    _MARGIN_SPEC_CACHE_MAX = 256
-
     def _margin_spec(self, symbol_config: Dict[str, Any]):
-        """The SymbolMarginSpec for a symbol config dict, memoised per Group."""
+        """The SymbolMarginSpec for a symbol config dict, memoised per Group.
+
+        R26: this used to build a SymbolMarginSpec by hand from a handful of keys and OMITTED
+        `hedged_use_larger_leg`, `margin_initial`, `margin_maintenance`, `tick_value`,
+        `tick_size`, `face_value`, `settlement_price` and `margin_currency_rate` - so if it
+        were ever wired it would DISAGREE with `SymbolMarginSpec.from_symbol`, the canonical
+        builder. That is the same class of defect as the two leverage resolvers (R1): a second
+        calculator that drifts.
+
+        Since a domain Symbol is not available here (the caller passes a config DICT), the
+        canonical `from_symbol` cannot be reused directly. Instead every field the canonical
+        builder reads is now read here too, so the two agree on a dict-shaped input.
+
+        The memoisation is kept: building a spec costs more than the arithmetic (profiled at
+        0.429s per 20k calls, of which basic_margin is only 0.064s).
+        """
         from core.domains.market_data.margin import SymbolMarginSpec
 
         cache = self.__dict__.get("_margin_spec_cache")
@@ -227,13 +180,35 @@ class Group:
         else:
             key = id(symbol_config)
             hit = cache.get(key)
-            # The stored dict must BE the one passed in, not merely have had its id.
+            # The stored dict must BE the one passed in, not merely share its id.
             if hit is not None and hit[0] is symbol_config:
                 return hit[1]
 
+        def _opt_decimal(name):
+            """An optional Decimal from the config, or None when absent/blank.
+
+            Distinguishes ABSENT from ZERO for the fields where that matters:
+            `margin_initial` / `margin_maintenance` / `settlement_price` are None when not
+            configured, and MT5 treats a zero MAINTENANCE rate as "use the initial rate"
+            for symbol settings - so collapsing None into 0 would change the maths.
+            """
+            if name not in symbol_config:
+                return None
+            value = symbol_config.get(name)
+            if value is None or value == "":
+                return None
+            try:
+                return Decimal(str(value))
+            except (TypeError, ValueError, ArithmeticError):
+                return None
+
+        def _decimal(name, default=ZERO):
+            value = _opt_decimal(name)
+            return default if value is None else value
+
         spec = SymbolMarginSpec(
             name=str(symbol_config.get("name", "")),
-            contract_size=Decimal(str(symbol_config.get("contract_size", 100000))),
+            contract_size=_decimal("contract_size", Decimal("100000")),
             calc_mode=int(symbol_config.get("calc_mode", 0) or 0),
             margin_currency=str(
                 symbol_config.get("margin_currency")
@@ -241,7 +216,18 @@ class Group:
                 or self.currency
                 or ""
             ),
-            margin_hedged=Decimal(str(symbol_config.get("margin_hedged", 0) or 0)),
+            margin_hedged=_decimal("margin_hedged"),
+            # ---- the fields this builder used to OMIT (R26) ----
+            hedged_use_larger_leg=bool(
+                symbol_config.get("hedged_use_larger_leg", False)
+            ),
+            margin_initial=_opt_decimal("margin_initial"),
+            margin_maintenance=_opt_decimal("margin_maintenance"),
+            tick_value=_decimal("tick_value"),
+            tick_size=_decimal("tick_size"),
+            face_value=_decimal("face_value"),
+            settlement_price=_opt_decimal("settlement_price"),
+            margin_currency_rate=_decimal("margin_currency_rate"),
             rates={
                 key: Decimal(str(value))
                 for key, value in symbol_config.items()
@@ -315,6 +301,144 @@ class Group:
             rate_lookup=rate_lookup,
         )
         return apply_rate(converted, spec, str(operation).upper(), maintenance)
+
+    #: R27: MT5 floating leverage, read from `mt5_extra["leverage_tiers"]`.
+
+    #:
+
+    #: `core/domains/market_data/leverage_tiers.py` implements the feature exactly -
+
+    #: rules top-to-bottom, first match wins, an ADDITIONAL COEFFICIENT on top of the
+
+    #: symbol rates, zero maintenance meaning no margin, exchange groups exempt - and had
+
+    #: NO production caller, so floating leverage had no effect at all.
+
+    #:
+
+    #: No migration is needed: `mt5_extra` is a JSONB column that already carries
+
+    #: MT5-only group configuration and round-trips through the existing mappers.
+
+    @property
+
+    def leverage_profile(self):
+
+        """The group's floating-leverage profile, or None when none is configured."""
+
+        raw = None
+
+        extra = getattr(self, "mt5_extra", None)
+
+        if isinstance(extra, dict):
+
+            raw = extra.get("leverage_tiers")
+
+        if raw is None:
+
+            raw = self.__dict__.get("leverage_profile_raw")
+
+        if not raw:
+
+            return None
+
+        try:
+
+            from core.domains.market_data.leverage_tiers import parse_profile
+
+
+            return parse_profile(raw)
+
+        except Exception as exc:  # noqa: BLE001
+
+            # A malformed profile must not SILENTLY disable floating leverage. The
+
+            # settings exist, so this is logged; the caller then runs with no tiers,
+
+            # which is the pre-existing behaviour.
+
+            import logging
+
+
+            logging.getLogger(__name__).error(
+
+                "group %s has an unreadable leverage_tiers profile: %s",
+
+                getattr(self, "name", "?"), exc,
+
+            )
+
+            return None
+
+
+
+    def get_symbol_config(self, symbol_name: str) -> Dict[str, Any]:
+        """Get effective symbol configuration for this Group."""
+        config = {}
+        for override in self.symbol_overrides:
+            if self._matches_symbol_pattern(symbol_name, override.symbol_pattern):
+                if override.trade_mode is not None:
+                    config['trade_mode'] = override.trade_mode
+                if override.execution_mode is not None:
+                    config['execution_mode'] = override.execution_mode
+                if override.volume_min is not None:
+                    config['volume_min'] = override.volume_min
+                if override.volume_max is not None:
+                    config['volume_max'] = override.volume_max
+                if override.volume_limit is not None:
+                    config['volume_limit'] = override.volume_limit
+                if override.spread_diff is not None:
+                    config['spread_diff'] = override.spread_diff
+                if override.margin_rate_initial_buy is not None:
+                    config['margin_rate_initial_buy'] = override.margin_rate_initial_buy
+                if override.margin_rate_initial_sell is not None:
+                    config['margin_rate_initial_sell'] = override.margin_rate_initial_sell
+                if override.swap_long is not None:
+                    config['swap_long'] = override.swap_long
+                if override.swap_short is not None:
+                    config['swap_short'] = override.swap_short
+                break
+        return config
+    
+    def _matches_symbol_pattern(self, symbol: str, pattern: str) -> bool:
+        """Check if symbol matches pattern (supports wildcards)."""
+        if pattern.endswith("*"):
+            prefix = pattern[:-1]
+            return symbol.startswith(prefix)
+        return symbol == pattern
+    
+    def is_symbol_allowed(self, symbol: str) -> bool:
+        """Check if a symbol is allowed for this group."""
+        allowed = self.permissions.allowed_symbols
+        if "*" in allowed:
+            return True
+        for pattern in allowed:
+            if pattern.endswith("*"):
+                prefix = pattern[:-1]
+                if symbol.startswith(prefix):
+                    return True
+            elif symbol == pattern:
+                return True
+        return False
+    
+    # ------------------------------------------------------------------
+    # Margin spec memoisation
+    # ------------------------------------------------------------------
+    #
+    # Building a SymbolMarginSpec from the caller's dict costs more than the margin
+    # arithmetic itself (profiled: 0.429s per 20k calls, of which basic_margin is only
+    # 0.064s). Symbol configuration does not change between calls in the normal case -
+    # changing it is an admin operation that invalidates ConfigCache - so the work is
+    # pure repetition on the pre-trade hot path.
+    #
+    # Keyed on id(symbol_config), with the dict itself held in the entry so its id cannot
+    # be recycled while the entry lives. Bounded, so a caller that builds a fresh dict per
+    # call cannot grow it without limit.
+
+    _MARGIN_SPEC_CACHE_MAX = 256
+
+
+
 
     def calculate_commission(
         self,

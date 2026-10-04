@@ -259,6 +259,10 @@ async def build_trading_stack(
         risk_engine=risk_engine,
         symbol_repo=symbol_repo,
         account_repo=account_repo,
+        # R10: the holiday gate probed `symbol_repo`, which has no holiday methods, so
+        # MT5's "request time not on a holiday" rule never ran. The real repository is
+        # already built and registered as `holiday_repo`; this passes it in.
+        holiday_repo=_resolve(container, "holiday_repo", required=False),
     )
 
     # M7: client pricing - group spread transforms (SpreadDiff/Balance, fixed

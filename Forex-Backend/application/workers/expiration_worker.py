@@ -15,8 +15,10 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
+from application.services.margin_reservation import release_margin
 from core.events.domain_events import OrderCancelled
 from core.ports.interfaces import IEventBus, IOrderRepository
 
@@ -75,6 +77,21 @@ class ExpirationWorker:
         cancelled = 0
         for order in expired:
             try:
+                # Release the hold BEFORE cancelling, so a crash between the two cannot
+                # leave the reservation stranded with nothing recording why. The old code
+                # cancelled and saved without ever calling release_margin, so every
+                # expired pending order leaked its hold out of the freemargin the client
+                # could still use: reserve_margin subtracts margin_reserved from
+                # availability, and nothing ever gave it back.
+                hold = Decimal(str(getattr(order, "reserved_margin", 0) or 0))
+                if hold > Decimal("0"):
+                    await release_margin(
+                        getattr(self, "account_repo", None),
+                        order.account_login,
+                        hold,
+                    )
+                    order.reserved_margin = Decimal("0")
+
                 order.cancel("expired")  # state machine: CANCELLED + time_done
                 await self.order_repo.save(order)
                 await self.event_bus.publish(

@@ -91,9 +91,21 @@ class ModifyOrderHandler:
             volume = order.volume_current.value
             contract_size = order.contract_size
 
-            old_margin = (old_price * volume * contract_size) / Decimal('100')
-            new_margin = (new_price * volume * contract_size) / Decimal('100')
-            margin_delta = new_margin - old_margin
+            # R16: do NOT re-derive the requirement with a local formula.
+            #
+            # This was `(price * volume * contract_size) / Decimal('100')` - the FOURTH
+            # independent margin formula in the codebase: hardcoded leverage 100, the CFD
+            # price term applied to Forex, no calc mode, no margin rate, no conversion.
+            #
+            # The reservation was already computed by `risk_service` and stored on the
+            # order, so scaling THAT by the price ratio is exact.
+            volume = order.volume_current.value
+            old_margin = Decimal(str(getattr(order, "reserved_margin", 0) or 0))
+            if old_price != 0 and old_margin > 0:
+                new_margin = old_margin * (new_price / old_price)
+                margin_delta = new_margin - old_margin
+            else:
+                margin_delta = Decimal("0")
 
         # 5. Modify the order (inside per-account lock)
         async with self.risk_service.account_lock(command.account_login):
@@ -120,21 +132,39 @@ class ModifyOrderHandler:
             if command.new_expiration is not None:
                 order.time_expiration = command.new_expiration
 
-            # Update margin if price changed
-            if margin_delta != Decimal('0'):
+            # R16: move the RESERVATION, not `margin_used`.
+            #
+            # This edited `account.margin_used` / `margin_free` and full-row saved, never
+            # touching `orders.reserved_margin` or `accounts.margin_reserved`. A pending
+            # order holds a RESERVATION; it does not consume position margin until it fills,
+            # which is why the two columns exist separately. Writing `margin_used` here also
+            # made a pending order look like a filled position to every reader of it.
+            if margin_delta != Decimal("0"):
+                from application.services.margin_reservation import (
+                    release_margin,
+                    reserve_margin,
+                )
+
                 account = await self.account_repo.find_by_login(command.account_login)
                 if account:
-                    account.margin_used = Money(
-                        account.margin_used.amount + margin_delta,
-                        account.currency
-                    )
-                    account.margin_free = Money(
-                        account.margin_free.amount - margin_delta,
-                        account.currency
-                    )
-                    if account.margin_used.amount > Decimal('0'):
-                        account.recompute_margin_level()
-                    await self.account_repo.save(account)
+                    if margin_delta > 0:
+                        # `reserve_margin` is a conditional SQL update: it REFUSES rather
+                        # than over-committing the account.
+                        held = await reserve_margin(self.account_repo, account, margin_delta)
+                        if not held:
+                            raise ValueError(
+                                f"Insufficient free margin for the price change. "
+                                f"Additional required: {margin_delta}"
+                            )
+                    else:
+                        await release_margin(
+                            self.account_repo,
+                            command.account_login,
+                            -margin_delta,
+                            account=account,
+                        )
+                    # The order now records exactly what it holds.
+                    order.reserved_margin = max(Decimal("0"), old_margin + margin_delta)
 
             # Persist order
             saved_order = await self.order_repo.save(order)
@@ -156,4 +186,4 @@ class ModifyOrderHandler:
 
         logger.info(f"Order {command.ticket_id} modified")
 
-        return saved_order
+        return saved_order

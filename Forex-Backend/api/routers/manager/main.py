@@ -35,6 +35,13 @@ from application.queries.get_account_info import (
 )
 from application.queries.get_positions import GetManagerPositionsQueryHandler, GetManagerPositionsQuery
 
+from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+from core.domains.accounts.account import MARGIN_LEVEL_UNLIMITED
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
+
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/v1/manager", tags=["Manager - Main"])
@@ -69,7 +76,9 @@ async def user_get(
     group = str(info.get("group", info.get("group_name", ""))) if isinstance(info, dict) else getattr(info, "group", "")
     acc_login = int(info.get("login_id", info.get("login", login))) if isinstance(info, dict) else getattr(info, "login_id", login)
     
-    margin_level = Decimal("0")
+    # R15: the SENTINEL when no margin is in use, not 0. UserGet reported a flat
+    # account at level 0, which is below every stop-out threshold.
+    margin_level = MARGIN_LEVEL_UNLIMITED
     if margin > 0:
         margin_level = (equity / margin) * Decimal("100")
     
@@ -298,8 +307,14 @@ async def group_get(
         position_mode_str = "NETTING" if is_netting else "HEDGING"
         
         leverage = getattr(margin_prof, "leverage_default", getattr(g, "default_leverage", 100))
-        margin_call = getattr(margin_prof, "margin_call_level", getattr(g, "margin_call", 80.0))
-        margin_stop_out = getattr(margin_prof, "stop_out_level", getattr(g, "margin_stop_out", 50.0))
+        margin_call = getattr(
+            margin_prof, "margin_call_level",
+            getattr(g, "margin_call", DEFAULT_MARGIN_CALL_LEVEL),
+        )
+        margin_stop_out = getattr(
+            margin_prof, "stop_out_level",
+            getattr(g, "margin_stop_out", DEFAULT_STOP_OUT_LEVEL),
+        )
         
         acc_type = getattr(g, "account_type", "demo")
         acc_type_str = acc_type.value if hasattr(acc_type, "value") else str(acc_type)

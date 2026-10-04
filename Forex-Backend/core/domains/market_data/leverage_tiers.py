@@ -258,3 +258,56 @@ def _first_tier(tiers: Sequence[LeverageTier], measured: Decimal) -> Tuple[Optio
         if measured <= tier.to:
             return index, tier
     return None, None
+
+
+def parse_profile(raw: Any) -> Optional[LeverageProfile]:
+    """Build a LeverageProfile from the JSONB shape stored on the group.
+
+    R27: the profile lives in `groups.mt5_extra["leverage_tiers"]`, which is JSONB, so every
+    value arrives as a string or a number. Tolerant on TYPE, strict on SHAPE - an unreadable
+    profile returns None and the caller logs, because a half-applied tier table would silently
+    mis-price every account on the group, which is worse than not applying tiers at all.
+
+    The field names are the dataclasses' own (`to`, `range_type`), not MT5's UI labels, so a
+    reader can follow the mapping without a second table.
+    """
+    if not raw:
+        return None
+    if isinstance(raw, LeverageProfile):
+        return raw
+    if not isinstance(raw, dict):
+        return None
+
+    rules: List[LeverageRule] = []
+    for rule_raw in (raw.get("rules") or []):
+        if not isinstance(rule_raw, dict):
+            continue
+        tiers: List[LeverageTier] = []
+        for tier_raw in (rule_raw.get("tiers") or []):
+            if not isinstance(tier_raw, dict):
+                continue
+            raw_to = tier_raw.get("to")
+            tiers.append(
+                LeverageTier(
+                    # `None` means unbounded, which is also what an absent maximum means:
+                    # MT5 requires such a tier to be last, and the selector enforces that.
+                    to=Decimal(str(raw_to)) if raw_to not in (None, "", "inf") else None,
+                    initial_rate=Decimal(str(tier_raw.get("initial_rate", 1) or 1)),
+                    maintenance_rate=Decimal(str(tier_raw.get("maintenance_rate", 1) or 1)),
+                )
+            )
+        raw_range = str(rule_raw.get("range_type", "") or "").strip().lower()
+        try:
+            range_type = TierRange(raw_range) if raw_range else TierRange.VOLUME
+        except ValueError:
+            range_type = TierRange.VOLUME
+        rules.append(
+            LeverageRule(
+                name=str(rule_raw.get("name", "") or ""),
+                symbols=str(rule_raw.get("symbols", "") or ""),
+                range_type=range_type,
+                currency=str(rule_raw.get("currency", "") or ""),
+                tiers=tiers,
+            )
+        )
+    return LeverageProfile(name=str(raw.get("name", "") or ""), rules=rules) if rules else None

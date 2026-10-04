@@ -1,5 +1,7 @@
 """Account domain value objects (nested configuration structures)."""
 from dataclasses import dataclass, field
+
+from .thresholds import DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Optional
@@ -28,8 +30,13 @@ class MarginProfile:
     # PERCENT, matching MT5 (live export: MarginCall "50.00", MarginStopOut "30.00").
     # These were 0.8 / 0.5 fractions, which made every comparison against a
     # percent-scale margin level silently wrong in one direction or the other.
-    margin_call_level: Decimal = field(default_factory=lambda: Decimal('80'))
-    stop_out_level: Decimal = field(default_factory=lambda: Decimal('50'))
+    # R11: MT5's own numbers, not 80/50. The dataclass disagreed with the loader, the
+    # mapper AND the live export, and the more permissive default was the one an account
+    # fell back to when its group failed to load.
+    margin_call_level: Decimal = field(
+        default_factory=lambda: DEFAULT_MARGIN_CALL_LEVEL
+    )
+    stop_out_level: Decimal = field(default_factory=lambda: DEFAULT_STOP_OUT_LEVEL)
     stop_out_mode: StopOutMode = StopOutMode.PERCENT
     free_margin_mode: FreeMarginMode = FreeMarginMode.USE_PL
     leverage_default: int = 100
