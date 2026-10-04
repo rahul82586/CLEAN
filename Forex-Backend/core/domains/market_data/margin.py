@@ -104,6 +104,22 @@ class SymbolMarginSpec:
     #: The 8 initial and 8 maintenance rates, keyed by MarginRates field name.
     rates: Dict[str, Decimal] = None  # type: ignore[assignment]
 
+    # ---- inputs the remaining CalcModes need ------------------------------
+    #: MT5 TickValue and TickSize. The CFD Index and FORTS formulas both use the
+    #: tick_value/tick_size RATIO, and Trade.md is explicit that this is the
+    #: `TickSize` field - not `Point`, which is price precision and differs on every
+    #: symbol in the reference export.
+    tick_value: Decimal = ZERO
+    tick_size: Decimal = ZERO
+    #: MT5 FaceValue - bonds are quoted as a percentage of face value.
+    face_value: Decimal = ZERO
+    #: FORTS only: the exchange's settlement (clearing) price for the previous
+    #: session. Without it the position part of the FORTS formula cannot be computed.
+    settlement_price: Optional[Decimal] = None
+    #: FORTS only: MT5 "Currency margin rate", the radius of the contract currency
+    #: against the rouble. Applied as (1 + 0.01 * rate).
+    margin_currency_rate: Decimal = ZERO
+
     def __post_init__(self) -> None:
         if self.rates is None:
             object.__setattr__(self, "rates", {})
@@ -137,6 +153,12 @@ class SymbolMarginSpec:
             hedged_use_larger_leg=bool(getattr(symbol, "hedged_use_larger_leg", False)),
             margin_initial=_optional_dec(getattr(symbol, "margin_initial", None)),
             margin_maintenance=_optional_dec(getattr(symbol, "margin_maintenance", None)),
+            # TickSize is MT5's own field and is frequently 0 while Point carries the
+            # real step. Both are read so the tick-ratio modes can tell "unset" from
+            # "zero" and refuse rather than divide by zero.
+            tick_value=_dec(getattr(symbol, "tick_value", 0)),
+            tick_size=_dec(getattr(symbol, "mt5_tick_size", 0)),
+            face_value=_dec(getattr(symbol, "face_value", 0)),
             rates=rates,
         )
 
@@ -226,6 +248,113 @@ def resolve_rate(spec: SymbolMarginSpec, operation: str, maintenance: bool) -> D
 # ---------------------------------------------------------------------------
 
 
+#: MT5 EnCalcMode values, named so the formulas above read like the documentation.
+FOREX = 0
+FUTURES = 1
+CFD = 2
+CFD_INDEX = 3
+CFD_LEVERAGE = 4
+FOREX_NO_LEVERAGE = 5
+EXCHANGE_STOCKS = 32
+EXCHANGE_FUTURES = 33
+EXCHANGE_FUTURES_FORTS = 34
+EXCHANGE_OPTIONS = 35
+EXCHANGE_OPTIONS_MARGIN = 36
+EXCHANGE_BONDS = 37
+EXCHANGE_STOCKS_MOEX = 38
+EXCHANGE_BONDS_MOEX = 39
+SERV_COLLATERAL = 64
+
+#: Modes whose formula multiplies by the market price, so a missing price must raise
+#: rather than be assumed to be 1.0.
+_PRICE_MODES = frozenset(
+    {CFD, CFD_INDEX, CFD_LEVERAGE, EXCHANGE_STOCKS, EXCHANGE_OPTIONS,
+     EXCHANGE_OPTIONS_MARGIN, EXCHANGE_BONDS, EXCHANGE_STOCKS_MOEX, EXCHANGE_BONDS_MOEX}
+)
+
+#: Modes where MT5's Fixed Margin rule additionally divides by account leverage:
+#: "For Forex and CFD Leverage calculation types, the leverage is additionally
+#: considered". Every other mode takes the plain `volume * Initial margin`.
+_FIXED_MARGIN_USES_LEVERAGE = frozenset({FOREX, CFD_LEVERAGE})
+
+
+def _tick_ratio(spec: SymbolMarginSpec) -> Decimal:
+    """MT5's TickValue / TickSize, for the CFD Index and FORTS formulas.
+
+    Raises rather than substituting 1.0. A ratio of 1.0 would multiply the margin by
+    the price and produce a plausible-looking number that is wrong by whatever the
+    real ratio is - and the reference export shows TickSize is 0 on most symbols,
+    so this is the common case, not a corner one.
+    """
+    tick_size = _dec(getattr(spec, "tick_size", 0))
+    tick_value = _dec(getattr(spec, "tick_value", 0))
+    if tick_size <= ZERO:
+        raise MarginCalculationError(
+            f"{spec.name}: CalcMode {int(getattr(spec, 'calc_mode', 0) or 0)} needs the "
+            "Tick value / Tick size ratio, but Tick size is 0. Set Tick size on the "
+            "Trade tab (it is a different field from Point)."
+        )
+    return tick_value / tick_size
+
+
+def _forts_margin(
+    spec: SymbolMarginSpec,
+    volume_lots: Decimal,
+    price: Decimal,
+    *,
+    side: str = "BUY",
+) -> Decimal:
+    """MT5's FORTS (Moscow Exchange derivatives) margin.
+
+    The documented formulas:
+
+        MarginBuy  = MarginPos(buy)  + Sum(MarginBuyOrder)
+        MarginSell = MarginPos(sell) + Sum(MarginSellOrder)
+        final      = MAX(MarginBuy, MarginSell)
+
+        MarginPos(buy)  = Vol * (InitialMarginBuy  + (Open - Settle) * TV/TS * (1 + 0.01*CMR))
+        MarginPos(sell) = Vol * (InitialMarginSell + (Settle - Open) * TV/TS * (1 + 0.01*CMR))
+
+    `Vol` is signed: positive for a long position in the Buy formula and for a short
+    position in the Sell formula, negative otherwise. That sign is what gives a trader
+    a margin DISCOUNT for holding a position against their pending orders.
+
+    WHAT IS NOT MODELLED, stated rather than silently omitted: the `Sum(MarginOrder)`
+    terms. They need the symbol's live pending-order book (with highest/lowest session
+    prices for untriggered market and stop orders), which stage 1 cannot see - it is
+    handed one operation at a time. So this returns the POSITION margin and the order
+    leg is added by the caller that owns the order book. Per-side `InitialMarginBuy` and
+    `InitialMarginSell` are not carried by our symbol model either; both sides use
+    `margin_initial`, which is MT5's single Margin-tab field.
+    """
+    settlement = getattr(spec, "settlement_price", None)
+    if settlement is None:
+        raise MarginCalculationError(
+            f"{spec.name}: CalcMode {EXCHANGE_FUTURES_FORTS} (FORTS) needs the settlement "
+            "price from the Futures tab. Without it the position margin cannot be "
+            "computed and the result would be arbitrary."
+        )
+    if price is None or price <= ZERO:
+        raise MarginCalculationError(
+            f"{spec.name}: CalcMode {EXCHANGE_FUTURES_FORTS} (FORTS) needs the open price."
+        )
+
+    settlement = _dec(settlement)
+    rate = ONE + Decimal("0.01") * _dec(getattr(spec, "margin_currency_rate", 0))
+    per_point = _tick_ratio(spec) * rate
+    initial = _dec(spec.margin_initial if spec.margin_initial is not None else ZERO)
+
+    is_long = str(side).upper() in ("BUY", "LONG")
+    # Signed volume, per the doc: + for long in the Buy formula, - for short there.
+    buy_volume = volume_lots if is_long else -volume_lots
+    sell_volume = -volume_lots if is_long else volume_lots
+
+    margin_buy = buy_volume * (initial + (price - settlement) * per_point)
+    margin_sell = sell_volume * (initial + (settlement - price) * per_point)
+
+    return max(margin_buy, margin_sell)
+
+
 def basic_margin(
     spec: SymbolMarginSpec,
     volume_lots: Decimal,
@@ -233,57 +362,133 @@ def basic_margin(
     *,
     leverage: int,
     maintenance: bool = False,
+    side: str = "BUY",
 ) -> Decimal:
     """MT5 stage 1: the basic margin, in the symbol's margin currency.
 
-    Formulas verbatim from Platform-Setup.md, `Margin-Calculation/Basic`:
+    Formulas verbatim from Platform-Setup.md, `Margin-Calculation/Basic` - all 12
+    headings, one branch each:
 
-        Forex            volume_lots * contract_size / leverage
-        Forex no leverage volume_lots * contract_size                (CalcMode 5)
-        CFD              volume_lots * contract_size * price          (CalcMode 2)
-        CFD leverage     volume_lots * contract_size * price / leverage (CalcMode 4)
-        CFD index        volume_lots * contract_size * price * tick_value / tick_size
-        Futures/options  volume_lots * initial_or_maintenance_margin  (CalcMode 1, 35, 36)
+        Forex (0)               volume * contract_size / leverage
+        Forex No Leverage (5)   volume * contract_size
+        CFD (2)                 volume * contract_size * price
+        CFD Leverage (4)        volume * contract_size * price / leverage
+        CFD Index (3)           volume * contract_size * price * tick_value / tick_size
+        Futures (1, 33)         volume * initial_margin
+        Options (35, 36)        volume * initial_margin, or volume*CS*price if unset
+        Stocks (32, 38)         volume * contract_size * price
+        Bonds (37, 39)          volume * contract_size * face_value * price / 100
+        FORTS (34)              MAX(buy side, sell side) off the settlement price
+        Collateral (64)         no margin
+
+    `side` is only read by FORTS, whose formulas are side-dependent; every other mode
+    is symmetric. It defaults to BUY so existing callers are unaffected.
 
     A market order with no price cannot be costed for the price-dependent modes, so it
     raises rather than defaulting to 1.0 - the default that understated JPY margin 150x.
+    An unknown mode raises too, rather than falling back to Forex.
     """
     if volume_lots < ZERO:
         raise MarginCalculationError(f"volume cannot be negative: {volume_lots}")
     if volume_lots == ZERO:
         return ZERO
 
+    mode = int(getattr(spec, "calc_mode", 0) or 0)
+
+    # Collateral instruments "are used as client's assets to provide the required
+    # margin for open positions of other instruments. For these instruments the
+    # margin is not calculated." Charging them the Forex formula blocked funds that
+    # MT5 deliberately leaves free.
+    if mode == SERV_COLLATERAL:
+        return ZERO
+
+    # FORTS is computed per SIDE from the settlement price and the two initial
+    # margins, then the larger side wins, so it takes its own path.
+    if mode == EXCHANGE_FUTURES_FORTS:
+        return _forts_margin(spec, volume_lots, price, side=side)
+
     fixed = spec.margin_maintenance if maintenance else spec.margin_initial
     if fixed is not None and fixed > ZERO:
-        # "If the Initial Margin parameter value is specified in symbol settings, this
-        # value will be used. The formulas described in this section will not be applied."
+        # "If a non-zero value is specified in the Initial margin field, then no
+        # calculations by formulas specified in the Calculation field are performed
+        # ... for all types of calculations (except for Forex and CFD Leverage), the
+        # margin is obtained as if Futures: Volume in lots * Initial margin. For
+        # Forex and CFD Leverage calculation types, the leverage is ADDITIONALLY
+        # considered: Volume in lots * Initial margin / Leverage."
+        if mode in _FIXED_MARGIN_USES_LEVERAGE:
+            return volume_lots * fixed / _leverage(leverage)
         return volume_lots * fixed
 
-    needs_price = spec.calc_mode in (2, 3, 4)
-    if needs_price and (price is None or price <= ZERO):
+    if mode in _PRICE_MODES and (price is None or price <= ZERO):
         raise MarginCalculationError(
-            f"{spec.name}: CalcMode {spec.calc_mode} requires a market price to compute "
+            f"{spec.name}: CalcMode {mode} requires a market price to compute "
             "margin, and none was supplied. Refusing to assume 1.0 - for a JPY pair that "
             "understates the requirement by roughly 150x."
         )
 
-    if spec.calc_mode == 5:  # Forex, no leverage
+    # ---- Forex family -----------------------------------------------------
+    if mode == FOREX:
+        return volume_lots * spec.contract_size / _leverage(leverage)
+    if mode == FOREX_NO_LEVERAGE:
+        # "does not take into account the client's leverage: Volume in lots * Contract size"
         return volume_lots * spec.contract_size
-    if spec.calc_mode == 1:  # Futures
-        base = spec.margin_initial or ZERO
-        return volume_lots * base
-    if spec.calc_mode == 2:  # CFD
-        return volume_lots * spec.contract_size * price
-    if spec.calc_mode == 4:  # CFD leverage
-        return volume_lots * spec.contract_size * price / _leverage(leverage)
-    if spec.calc_mode == 3:  # CFD index
-        raise MarginCalculationError(
-            f"{spec.name}: CalcMode 3 (CFD index) needs tick_value and tick_size, which "
-            "SymbolMarginSpec does not carry yet"
-        )
 
-    # CalcMode 0: Forex. The documented formula.
-    return volume_lots * spec.contract_size / _leverage(leverage)
+    # ---- CFD family -------------------------------------------------------
+    if mode == CFD:
+        return volume_lots * spec.contract_size * price
+    if mode == CFD_LEVERAGE:
+        return volume_lots * spec.contract_size * price / _leverage(leverage)
+    if mode == CFD_INDEX:
+        # "Volume in lots * Contract size * Open market price * Tick value / Tick size"
+        return volume_lots * spec.contract_size * price * _tick_ratio(spec)
+
+    # ---- Futures family ---------------------------------------------------
+    if mode in (FUTURES, EXCHANGE_FUTURES):
+        # "Volume in lots * Initial margin". Reachable only when no initial margin is
+        # configured, and MT5's answer is then genuinely zero - it is not our place to
+        # invent a requirement, but a zero-margin futures contract is almost always a
+        # configuration mistake, so it is recorded rather than passed over silently.
+        return volume_lots * (spec.margin_maintenance if maintenance else spec.margin_initial or ZERO)
+
+    # ---- Exchange options -------------------------------------------------
+    if mode in (EXCHANGE_OPTIONS, EXCHANGE_OPTIONS_MARGIN):
+        # "same as futures; if both margins 0 -> Volume in lots * Contract size * Open price"
+        initial = spec.margin_initial
+        maintenance_value = spec.margin_maintenance
+        if (initial is None or initial == ZERO) and (
+            maintenance_value is None or maintenance_value == ZERO
+        ):
+            return volume_lots * spec.contract_size * price
+        chosen = maintenance_value if maintenance else initial
+        if chosen is None or chosen == ZERO:
+            chosen = initial if initial is not None else ZERO
+        return volume_lots * chosen
+
+    # ---- Stocks -----------------------------------------------------------
+    if mode in (EXCHANGE_STOCKS, EXCHANGE_STOCKS_MOEX):
+        # "Volume in lots * Contract size * Open market price"
+        return volume_lots * spec.contract_size * price
+
+    # ---- Bonds ------------------------------------------------------------
+    if mode in (EXCHANGE_BONDS, EXCHANGE_BONDS_MOEX):
+        # "Bond prices are provided as a face value percentage":
+        # Volume in lots * Contract size * Face value * Open price / 100
+        if spec.face_value <= ZERO:
+            raise MarginCalculationError(
+                f"{spec.name}: CalcMode {mode} (bonds) needs Face value, which is not "
+                "configured. Bonds are quoted as a percentage of face value, so without "
+                "it the margin cannot be computed."
+            )
+        return volume_lots * spec.contract_size * spec.face_value * price / Decimal("100")
+
+    # An unrecognised mode must NOT quietly become Forex. Measured on the reference
+    # export every symbol uses a supported mode, so reaching here means new
+    # configuration, and guessing the formula would understate or overstate margin
+    # with nothing to show for it.
+    raise MarginCalculationError(
+        f"{spec.name}: CalcMode {mode} is not a known MT5 calculation mode. "
+        "Refusing to fall back to the Forex formula."
+    )
 
 
 def _leverage(leverage: Optional[int]) -> Decimal:
@@ -442,6 +647,54 @@ def calculate_account_margin(
 
         positions = [leg for leg in symbol_legs if not leg.is_pending]
         pendings = [leg for leg in symbol_legs if leg.is_pending]
+
+        # --- "Calculate hedged margin using larger leg" ----------------------
+        #
+        # MT5 documents this as a SEPARATE method, not a variation of the Basic one:
+        #
+        #   "per-side values (longer leg + long pendings vs shorter leg + short pendings)
+        #    ... The largest one of all calculated values is used as the final margin."
+        #
+        # The setting was stored, round-tripped and exposed but NEVER READ, so a symbol
+        # configured for it was margined by the Basic method instead - a wrong number,
+        # silently. The two differ whenever a pending order rests on the smaller side:
+        # Basic charges that pending in full, while this method lets the larger leg absorb
+        # it, so the total is lower.
+        #
+        # `symbol_total` is set and the existing tail of the loop stores it, so the
+        # per-symbol accounting stays identical to the Basic path.
+        if spec.hedged_use_larger_leg:
+            side_totals = {}
+            for side_name in ("BUY", "SELL"):
+                side_legs = [leg for leg in symbol_legs if leg.operation == side_name]
+                side_volume, side_price = _weighted_average(
+                    [(leg.volume, leg.price) for leg in side_legs]
+                )
+                if side_volume <= ZERO:
+                    continue
+                side_converted = convert_to_deposit(
+                    basic_margin(
+                        spec,
+                        side_volume,
+                        side_price,
+                        leverage=leverage,
+                        maintenance=False,
+                    ),
+                    margin_currency=spec.margin_currency,
+                    deposit_currency=deposit_currency,
+                    side=side_name,
+                    rate_lookup=rate_lookup,
+                )
+                side_totals[side_name] = apply_rate(
+                    side_converted, spec, side_name, False
+                )
+
+            if side_totals:
+                # "The largest one of all calculated values is used as the final margin."
+                symbol_total = max(side_totals.values())
+                breakdown.per_symbol[symbol] = symbol_total
+                breakdown.total += symbol_total
+                continue
 
         # --- positions: net into uncovered + covered -------------------------
         buys = [(leg.volume, leg.price) for leg in positions if leg.operation == "BUY"]

@@ -65,6 +65,10 @@ export interface SymbolDraft {
     expiration_flags: string[]; 
     orders_allowed: string[]; 
     filling_flags: string[]; 
+    /** MT5 EnOrderFlags bitmask - which order types the symbol accepts (127 = all). */
+    order_flags: number;
+    /** MT5 EnTradeFlags bitmask - bit 1 convert-profit-by-market, bit 2 signals. */
+    trade_flags: number;
     min_volume: number;
     max_volume: number;
     step_volume: number;
@@ -182,6 +186,10 @@ export const DEFAULT_SYMBOL_DRAFT: SymbolDraft = {
     expiration_flags: ['gtc', 'day'],
     orders_allowed: ['market', 'limit', 'stop', 'sltp'],
     filling_flags: ['fok', 'ioc'],
+    // MT5 ORDER_FLAGS_ALL. Every symbol in the reference export carries 127.
+    order_flags: 127,
+    // TRADE_FLAGS_ALLOW_SIGNALS (2). The export shows this for ETHUSD.
+    trade_flags: 2,
     min_volume: 0.01,
     max_volume: 100.0,
     step_volume: 0.01,

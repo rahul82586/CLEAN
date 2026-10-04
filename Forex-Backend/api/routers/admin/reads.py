@@ -941,6 +941,38 @@ symbol_reads_router = APIRouter(
 )
 
 
+async def _symbols_for_read(symbol_repo):
+    """The symbol list for a READ endpoint: ConfigCache first, repository as fallback.
+
+    Measured: `symbol_repo.get_all_symbols()` costs 214-336 ms because it hydrates 362
+    ORM rows of about 4 KB each (two JSONB blobs per row), while the SQL behind it runs
+    in 0.59 ms. ConfigCache already holds the same 362 domain Symbols in memory and is
+    kept current by the symbol CRUD events, so a read endpoint has no reason to pay the
+    hydration cost.
+
+    Falls back to the repository when the cache is absent - an uninitialised cache in a
+    test or a partial boot must not turn a working endpoint into a 503.
+    """
+    try:
+        from application.cache.config_cache import get_config_cache
+
+        cache = get_config_cache()
+    except Exception:                                     # noqa: BLE001 - not initialised
+        cache = None
+
+    if cache is not None:
+        try:
+            cached = cache.get_all_symbols()
+        except Exception:                                 # noqa: BLE001 - never fatal
+            cached = None
+        if cached:
+            return list(cached)
+
+    if symbol_repo is None:
+        return []
+    return await symbol_repo.get_all_symbols()
+
+
 def _paged_or_503(response: Response, rows: List[Any], total: int) -> List[Any]:
     return _paged(response, rows, total)
 
@@ -987,24 +1019,52 @@ async def ticks_snapshot(
     if engine is None:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE,
                             "No market data engine is wired on this server")
-    symbols = []
-    if symbol_repo is not None:
-        symbols = await symbol_repo.get_all_symbols()
+    symbols = await _symbols_for_read(symbol_repo)
     now = datetime.now(_tz.utc)
     out = []
     for sym in symbols:
         clean_name = sym.name.split('\\')[-1].split('/')[-1].upper()
+
+        # Is the symbol tradeable right now? Answered by the SAME entity method the
+        # pre-trade risk gate uses, so Market Watch and the order path cannot disagree.
+        try:
+            is_open = bool(sym.is_trade_session_active(now))
+        except Exception:                                  # noqa: BLE001
+            is_open = False
+
+        # The symbol's own "Max quote delay" - the value the order path enforces.
+        try:
+            delay = float(getattr(sym, "quotes_timeout", None) or 0)
+        except (TypeError, ValueError):
+            delay = 0.0
+
         tick = engine.get_latest_tick(sym.name) or engine.get_latest_tick(clean_name)
         if tick is None:
-            out.append({"symbol": sym.name, "bid": None, "ask": None, "spread": None,
-                        "source": None, "timestamp": None, "age_seconds": None})
+            out.append({
+                "symbol": sym.name, "bid": None, "ask": None, "spread": None,
+                "source": None, "timestamp": None, "age_seconds": None,
+                "is_market_open": is_open,
+                # 'no_data' is distinct from 'closed': we have never seen a price for
+                # this symbol. The UI shows something different for each.
+                "market_state": "no_data" if is_open else "closed",
+                "is_tick_stale": False,
+                "max_quote_delay": int(delay),
+            })
             continue
+
         age = (now - tick.timestamp).total_seconds() if tick.timestamp else None
+        # A delay of 0 means "not configured", which DISABLES the check - the same rule
+        # the order gate applies, so the two cannot drift.
+        stale = bool(age is not None and delay > 0 and age > delay)
         out.append({
             "symbol": sym.name, "bid": str(tick.bid), "ask": str(tick.ask),
             "spread": str(tick.spread), "source": tick.source,
             "timestamp": tick.timestamp.isoformat() if tick.timestamp else None,
             "age_seconds": round(age, 1) if age is not None else None,
+            "is_market_open": is_open,
+            "market_state": "open" if is_open else "closed",
+            "is_tick_stale": stale,
+            "max_quote_delay": int(delay),
         })
     return out
 
@@ -1389,6 +1449,29 @@ async def delete_holiday(holiday_id: str) -> Dict[str, Any]:
 # symbol sessions (B16) - the session model exists and pre-trade already uses
 # it; this just lets the UI ask the same question MT5's IsTradeSession asks
 # ---------------------------------------------------------------------------
+
+
+@symbol_reads_router.get("/schema")
+async def symbol_schema() -> Dict[str, Any]:
+    """The MT5 ConfigSymbols field descriptors the Symbol editor renders FROM:
+    names, types, units, expanded enums, the MT5 tab each field sits on, and - 
+    honestly - whether the field is modelled and writable TODAY.
+
+    This is what removes the hardcoding. Before it existed the editor kept its own
+    field list and its own option lists in TypeScript, so the Quotes tab had no
+    source of truth at all and rendered a stale default object instead of the
+    server's values.
+
+    Registered BEFORE /{symbol_name}/sessions and before admin_router's
+    /symbols/{symbol_name:path}, because that catch-all would otherwise match
+    "schema" as a symbol name and 404.
+    """
+    from application.queries.get_field_schema import UnknownSchemaError, get_field_schema
+
+    try:
+        return get_field_schema("symbol")
+    except UnknownSchemaError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
 
 @symbol_reads_router.get("/{symbol_name}/sessions")

@@ -6,6 +6,7 @@ and bar aggregations across the trading platform.
 
 Architectural Rule: Pure domain orchestrator in core/, zero framework imports.
 """
+import asyncio
 import logging
 from typing import Any, Dict, List, Optional
 
@@ -42,6 +43,10 @@ class MarketDataEngine:
         self.event_bus = event_bus
         self.symbol_repo = symbol_repo
         self.redis_cache = redis_cache
+        #: Strong references to in-flight Redis mirror tasks. The event loop only keeps a
+        #: weak reference to a running task, so without this a pending write can be
+        #: collected before it runs and the entry silently never appears.
+        self._cache_tasks: set = set()
         self.bar_repository = bar_repository
         self.max_tick_age_seconds = self._resolve_max_tick_age(max_tick_age_seconds)
         #: per-symbol counters so a rejected feed is visible without flooding the log
@@ -161,12 +166,18 @@ class MarketDataEngine:
         for aggregator in aggregators.values():
             await aggregator.process_tick(tick)
 
-        # Cache tick in Redis if cache adapter injected
+        # Mirror the tick into Redis, for readers that do NOT share this process's
+        # memory.
+        #
+        # Not awaited. A Redis round trip per tick serialises ingestion: with several
+        # symbols at 20 ticks/s the loop cannot outrun a 1 ms write, and one slow Redis
+        # response stalls every symbol behind it. The write is fire-and-forget with the
+        # exception logged - a cache must never be able to break price ingestion.
+        #
+        # The 60s TTL the cache applies is deliberately kept: it is the mechanism that
+        # makes a stale entry EXPIRE. The in-memory map has no such bound.
         if self.redis_cache:
-            try:
-                await self.redis_cache.cache_tick(tick)
-            except Exception as e:
-                logger.error(f"Failed to cache tick for {symbol} in Redis: {e}")
+            self._mirror_tick_to_cache(tick)
 
         # Publish domain event for downstream consumers (Risk Engine, OMS, WebSockets)
         event = TickReceived(
@@ -216,6 +227,58 @@ class MarketDataEngine:
             }
         )
         await self.event_bus.publish(event)
+
+    def _mirror_tick_to_cache(self, tick: Tick) -> None:
+        """Queue a Redis write for this tick, without awaiting it.
+
+        The task is held in `self._cache_tasks` until it completes. Without a strong
+        reference the event loop may garbage-collect a pending task before it runs, which
+        would silently drop writes - the failure mode would look like "Redis is randomly
+        empty", not like an error.
+        """
+        try:
+            task = asyncio.create_task(self.redis_cache.cache_tick(tick))
+        except Exception as exc:                          # noqa: BLE001
+            logger.error("could not schedule the Redis tick mirror for %s: %s",
+                         tick.symbol, exc)
+            return
+        self._cache_tasks.add(task)
+        task.add_done_callback(self._cache_tasks.discard)
+
+        def _report(finished: "asyncio.Task") -> None:    # noqa: ANN001
+            if finished.cancelled():
+                return
+            error = finished.exception()
+            if error is not None:
+                logger.error("Failed to cache tick in Redis: %s", error)
+
+        task.add_done_callback(_report)
+
+    def get_cached_ticks(self) -> Dict[str, Dict[str, Any]]:
+        """The Redis view of every cached tick, for a reader outside this process.
+
+        Returns {} when no cache is wired or the read fails, so a caller falls back to its
+        own source rather than seeing an exception. This is the READ side of a cache that
+        was previously written and never read - the write existed only to serve callers
+        that could not reach the engine's memory.
+        """
+        if self.redis_cache is None:
+            return {}
+        getter = getattr(self.redis_cache, "get_all_ticks", None)
+        if getter is None:
+            return {}
+
+        async def _read() -> Dict[str, Dict[str, Any]]:
+            try:
+                result = getter()
+                if hasattr(result, "__await__"):
+                    result = await result
+                return dict(result or {})
+            except Exception as exc:                      # noqa: BLE001
+                logger.error("could not read cached ticks from Redis: %s", exc)
+                return {}
+
+        return asyncio.ensure_future(_read())             # type: ignore[return-value]
 
     def get_latest_tick(self, symbol: str) -> Optional[Tick]:
         """Get the latest cached tick for a symbol."""

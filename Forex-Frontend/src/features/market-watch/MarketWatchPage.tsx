@@ -3,17 +3,34 @@ import { API } from '../../services/api';
 
 interface QuoteRow {
     symbol: string;
-    bid: number;
-    ask: number;
+    // null means the server has NO price for this symbol. It must never be
+    // rendered as 0, which is what previously turned an absent quote into a 0.00
+    // price - a fabricated value on the one screen whose job is prices.
+    bid: number | null;
+    ask: number | null;
+    /** Seconds since the tick, or Infinity when there has never been one. */
     age: number;
-    spread: number;
+    spread: number | null;
+    /** 'open' | 'closed' | 'no_data' - from the server, not inferred here. */
+    marketState?: 'open' | 'closed' | 'no_data';
+    isMarketOpen?: boolean;
+    /** The quote is older than this symbol's own Max quote delay. */
+    isTickStale?: boolean;
+    maxQuoteDelay?: number;
     prevBid?: number;
     prevAsk?: number;
     flashBid?: 'up' | 'down';
     flashAsk?: 'up' | 'down';
 }
 
-function formatPrice(v: number): string {
+/**
+ * A price, or an em dash when there is none.
+ *
+ * null/undefined means the server has no quote for this symbol. It must NOT render as
+ * 0.00 - that is a fabricated price - and it must not crash. An em dash says "no value".
+ */
+function formatPrice(v: number | null | undefined): string {
+    if (v == null || !Number.isFinite(v)) return '\u2014';
     if (v >= 10000) return v.toFixed(2);
     if (v >= 100)   return v.toFixed(3);
     return v.toFixed(5);
@@ -26,10 +43,41 @@ function formatAge(s: number): string {
     return `${Math.floor(s / 3600)}h`;
 }
 
-function ageColor(age: number): string {
+/**
+ * Age colour for a quote.
+ *
+ * A CLOSED market is not a fault: the last price is the last real price and is expected
+ * to be hours old. Colouring that red is exactly what made a shut weekend look like a
+ * dead feed, so closed symbols get a neutral colour and only an OPEN symbol can be
+ * alarming.
+ *
+ * While open, the symbol's own Max quote delay decides "stale" - the same value the
+ * order path enforces - falling back to a plain age threshold when it is not configured.
+ */
+function ageColor(age: number, row?: QuoteRow): string {
+    const neutral = 'var(--theia-descriptionForeground, #8b8b8b)';
+
+    if (row && row.marketState === 'closed') return neutral;
+
+    if (row?.isTickStale) return 'var(--theia-errorForeground, #e74c3c)';
+
+    const limit = row?.maxQuoteDelay && row.maxQuoteDelay > 0 ? row.maxQuoteDelay : 30;
     if (age < 5) return 'var(--theia-successForeground, #2ecc71)';
-    if (age < 30) return 'var(--theia-warningForeground, #f1c40f)';
+    if (age < limit) return 'var(--theia-warningForeground, #f1c40f)';
     return 'var(--theia-errorForeground, #e74c3c)';
+}
+
+/** The label and colour for a row's market state. */
+function marketStateBadge(state?: string): { label: string; color: string } {
+    switch (state) {
+        case 'open':
+            return { label: 'Open', color: 'var(--theia-successForeground, #2ecc71)' };
+        case 'no_data':
+            return { label: 'No data', color: 'var(--theia-errorForeground, #e74c3c)' };
+        case 'closed':
+        default:
+            return { label: 'Closed', color: 'var(--theia-descriptionForeground, #8b8b8b)' };
+    }
 }
 
 export function MarketWatchPage(): React.ReactElement {
@@ -40,6 +88,36 @@ export function MarketWatchPage(): React.ReactElement {
     const prevRef = React.useRef<Record<string, { bid: number; ask: number }>>({});
     const flashTimers = React.useRef<Record<string, ReturnType<typeof setTimeout>>>({});
 
+
+    // One line summarising the market, derived from the SAME rows the table shows.
+    //
+    // Counted from market_state, which the server derives from each symbol's real trading
+    // sessions - so this cannot disagree with the per-row badge or with the order gate.
+    const marketSummary = React.useMemo(() => {
+        const total = quotes.length;
+        const open = quotes.filter(q => q.marketState === 'open').length;
+        const noData = quotes.filter(q => q.marketState === 'no_data').length;
+        const closed = total - open - noData;
+        let text: string;
+        let color: string;
+        if (total === 0) {
+            text = 'Waiting for market data...';
+            color = 'var(--theia-descriptionForeground, #8b8b8b)';
+        } else if (open === 0) {
+            // Every symbol shut is NORMAL at the weekend. Saying so plainly is the point:
+            // the earlier screen made this look like a failure.
+            text = `Market closed - 0 of ${total} symbols tradeable`
+                + (noData > 0 ? `, ${noData} with no price` : '')
+                + '. FX reopens around 21:00-22:00 UTC on Sunday.';
+            color = 'var(--theia-descriptionForeground, #8b8b8b)';
+        } else {
+            text = `Market open - ${open} of ${total} symbols tradeable`
+                + (closed > 0 ? `, ${closed} closed` : '')
+                + (noData > 0 ? `, ${noData} with no price` : '') + '.';
+            color = 'var(--theia-successForeground, #2ecc71)';
+        }
+        return { text, color, total, open, closed, noData };
+    }, [quotes]);
     const fetchQuotes = React.useCallback(async () => {
         try {
             const data = await API.getTicks();
@@ -50,32 +128,53 @@ export function MarketWatchPage(): React.ReactElement {
                 const prevMap: Record<string, QuoteRow> = {};
                 prev.forEach(r => { prevMap[r.symbol] = r; });
 
+                // NO age filter. This previously dropped every symbol whose quote was
+                // older than 60 seconds, so after the FX close 356 of 362 instruments
+                // disappeared from the table with nothing to say they had been removed -
+                // the screen looked healthy while almost the whole list was missing.
+                // Every symbol is now listed and labelled.
                 const rows: QuoteRow[] = Object.entries(data)
-                    .filter(([_, q]) => q.age <= 60)
                     .map(([symbol, q]) => {
                         const old = prevRef.current[symbol];
                         let flashBid: 'up' | 'down' | undefined;
                         let flashAsk: 'up' | 'down' | undefined;
 
-                        if (old) {
-                            if (q.bid > old.bid) flashBid = 'up';
-                            else if (q.bid < old.bid) flashBid = 'down';
-                            if (q.ask > old.ask) flashAsk = 'up';
-                            else if (q.ask < old.ask) flashAsk = 'down';
+                        // Both sides must be REAL numbers. With nulls, `null > 100` is false
+                        // but `null < 100` is TRUE, so a symbol going from no-price to priced
+                        // would flash as a fall, and one losing its price would too.
+                        const haveOld = !!old && old.bid != null && old.ask != null;
+                        const haveNew = q.bid != null && q.ask != null;
+                        if (haveOld && haveNew) {
+                            const prev = old as { bid: number; ask: number };
+                            if (q.bid > prev.bid) flashBid = 'up';
+                            else if (q.bid < prev.bid) flashBid = 'down';
+                            if (q.ask > prev.ask) flashAsk = 'up';
+                            else if (q.ask < prev.ask) flashAsk = 'down';
                         }
 
                         prevRef.current[symbol] = { bid: q.bid, ask: q.ask };
 
-                        const rawSpread = q.spread !== undefined && q.spread !== null ? q.spread : (q.ask - q.bid);
-                        const spreadVal = q.ask < 10
-                            ? Math.round(rawSpread * 100000) / 10
-                            : Math.round(rawSpread * 100) / 100;
+                        // q.ask - q.bid on nulls is 0, which would print a 0.0 spread for a
+                        // symbol with no quote. Absent stays absent.
+                        const rawSpread = q.spread != null
+                            ? q.spread
+                            : (q.ask != null && q.bid != null ? q.ask - q.bid : null);
+                          const spreadVal = rawSpread == null
+                              ? null
+                              : (q.ask < 10
+                                  ? Math.round(rawSpread * 100000) / 10
+                                  : Math.round(rawSpread * 100) / 100);
 
                         return {
                             symbol,
                             bid: q.bid,
                             ask: q.ask,
-                            age: q.age,
+                              // A missing age is not 0 seconds old; it is unknown.
+                              age: q.age != null ? q.age : Number.POSITIVE_INFINITY,
+                              marketState: q.marketState ?? 'no_data',
+                              isMarketOpen: q.isMarketOpen,
+                              isTickStale: q.isTickStale,
+                              maxQuoteDelay: q.maxQuoteDelay,
                             spread: spreadVal,
                             prevBid: old?.bid,
                             prevAsk: old?.ask,
@@ -185,6 +284,18 @@ export function MarketWatchPage(): React.ReactElement {
                 </div>
             )}
 
+            {/* Market status, stated once at the top. The page previously gave no
+                indication of market state, so a correctly-closed weekend looked like a
+                broken feed. */}
+            <div style={{
+                padding: '5px 12px', fontSize: 11, flexShrink: 0,
+                color: marketSummary.color,
+                borderBottom: '1px solid var(--theia-border)',
+                background: 'var(--theia-sideBarSectionHeader-background)',
+            }}>
+                {marketSummary.text}
+            </div>
+
             {/* Table */}
             <div style={{ flex: 1, overflow: 'auto' }}>
                 {filtered.length === 0 ? (
@@ -246,19 +357,41 @@ export function MarketWatchPage(): React.ReactElement {
                                         {formatPrice(row.ask)}
                                     </td>
                                     <td style={{ ...tdStyle, textAlign: 'right', color: 'var(--theia-descriptionForeground)', fontFamily: 'monospace' }}>
-                                        {row.bid > 100 ? row.spread.toFixed(2) : row.spread.toFixed(1)}
+                                          {row.spread == null ? '\u2014' : (row.bid != null && row.bid > 100 ? row.spread.toFixed(2) : row.spread.toFixed(1))}
                                     </td>
-                                    <td style={{ ...tdStyle, textAlign: 'right', color: ageColor(row.age), fontFamily: 'monospace' }}>
+                                    <td style={{ ...tdStyle, textAlign: 'right', color: ageColor(row.age, row), fontFamily: 'monospace' }}>
                                         {formatAge(row.age)}
                                     </td>
-                                    <td style={{ ...tdStyle, textAlign: 'center' }}>
-                                        <span style={{
-                                            display: 'inline-block', width: 7, height: 7,
-                                            borderRadius: '50%',
-                                            background: row.age < 5 ? '#2ecc71' : row.age < 30 ? '#f1c40f' : '#e74c3c',
-                                            boxShadow: row.age < 5 ? '0 0 5px #2ecc7188' : 'none'
-                                        }} />
-                                    </td>
+                                      {/* The real market state, as a labelled badge. This column used to
+                                          be a bare dot driven only by age, so a correctly-closed weekend
+                                          and a dead feed looked identical. */}
+                                      <td style={{ ...tdStyle, textAlign: 'center' }}>
+                                          {(() => {
+                                              const badge = marketStateBadge(row.marketState);
+                                              return (
+                                                  <span
+                                                      title={
+                                                          row.marketState === 'closed'
+                                                              ? "Outside this symbol's trading session. The last price is the last real price."
+                                                              : row.marketState === 'no_data'
+                                                                  ? 'No quote has been received for this symbol.'
+                                                                  : 'Inside the trading session.'
+                                                      }
+                                                      style={{
+                                                          display: 'inline-flex', alignItems: 'center', gap: 5,
+                                                          fontSize: 10, color: badge.color, whiteSpace: 'nowrap',
+                                                      }}
+                                                  >
+                                                      <span style={{
+                                                          display: 'inline-block', width: 7, height: 7,
+                                                          borderRadius: '50%', background: badge.color,
+                                                          boxShadow: row.marketState === 'open' ? '0 0 5px #2ecc7188' : 'none',
+                                                      }} />
+                                                      {badge.label}
+                                                  </span>
+                                              );
+                                          })()}
+                                      </td>
                                 </tr>
                             ))}
                         </tbody>

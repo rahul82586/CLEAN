@@ -37,6 +37,10 @@ export function GroupSettingsModal({ groupName, initialName = '', onClose, onSav
     const [errors, setErrors] = React.useState<Record<string, string>>({});
     const [loading, setLoading] = React.useState(false);
     const [saveError, setSaveError] = React.useState<string | null>(null);
+    //: Set when the server reports MT_RET_REQUEST_NO_CHANGES. That is a correct answer,
+    //: not a failure, so it gets its own informational treatment rather than the red
+    //: error box.
+    const [saveNotice, setSaveNotice] = React.useState<string | null>(null);
 
     const isEditing = !!groupName;
 
@@ -108,6 +112,7 @@ export function GroupSettingsModal({ groupName, initialName = '', onClose, onSav
     const handleSave = async (e: React.FormEvent) => {
         e.preventDefault();
         setSaveError(null);
+        setSaveNotice(null);
 
         if (!validateAll()) {
             setSaveError('Please correct validation errors on marked tabs before saving.');
@@ -143,7 +148,31 @@ export function GroupSettingsModal({ groupName, initialName = '', onClose, onSav
             onSaved();
             onClose();
         } catch (err: any) {
-            setSaveError(err.message || 'Failed to save group details.');
+            const message = String(err?.message ?? err ?? '');
+            const apiStatus = err?.status ?? err?.statusCode;
+
+            // MT5 returns this when a PUT would change nothing. The rule is deliberate
+            // and stays enforced server-side; it simply is not an error from the
+            // operator's point of view, and showing it in the error box made an
+            // unchanged form look like a broken save.
+            //
+            // Matched on the message because that is what the API's `detail` field
+            // carries through the transport. Deliberately narrow: any other 400 keeps
+            // the red error treatment, so a real rejection (bad leverage, a refused
+            // currency change) is still surfaced as a failure.
+            const isNoChanges =
+                /MT_RET_REQUEST_NO_CHANGES/i.test(message) ||
+                /does not contain changes/i.test(message);
+
+            if (isNoChanges) {
+                setSaveError(null);
+                setSaveNotice('No changes to save — the group already matches what you entered.');
+                onSaved();
+                onClose();
+                return;
+            }
+
+            setSaveError(message || `Failed to save group details.${apiStatus ? ` (HTTP ${apiStatus})` : ''}`);
         } finally {
             setLoading(false);
         }
@@ -201,7 +230,12 @@ export function GroupSettingsModal({ groupName, initialName = '', onClose, onSav
                             </div>
                         )}
                         
-                        {saveError && (
+                        {saveNotice && !saveError && (
+                        <div className="adm-hint" style={{ margin: '0 0 8px 0' }}>
+                            <i className="codicon codicon-info" /> {saveNotice}
+                        </div>
+                    )}
+                    {saveError && (
                             <div className="adm-hint" style={{ background: 'var(--theia-inputValidation-errorBackground)', color: 'var(--theia-errorForeground)', margin: '0 0 16px 0' }}>
                                 <i className="codicon codicon-error" /> {saveError}
                             </div>

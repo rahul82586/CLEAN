@@ -61,6 +61,9 @@ export const API: ApiFacade = {
 
     getSymbols: (...a) => activeTransport().getSymbols(...a),
     getSymbolDetail: (...a) => activeTransport().getSymbolDetail(...a),
+    getSymbolSchema: (...a) => activeTransport().getSymbolSchema(...a),
+    getSymbolSessions: (...a) => activeTransport().getSymbolSessions(...a),
+    getSymbolFields: (...a) => activeTransport().getSymbolFields(...a),
     createSymbol: (...a) => activeTransport().createSymbol(...a),
     updateSymbol: (...a) => activeTransport().updateSymbol(...a),
     deleteSymbol: (...a) => activeTransport().deleteSymbol(...a),

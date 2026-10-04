@@ -205,38 +205,74 @@ function mapSymbol(s: any) {
  * Fields bp doesn't persist yet are simply absent → the modal shows its own
  * defaults (visible, honest gap; same pattern as groups).
  */
+/**
+ * MT5 CalcMode -> the label the Trade tab shows.
+ *
+ * Derived from the schema the backend serves (generated from
+ * core.domains.instruments.enums.CalculationMode, which is verified against the MT5
+ * SDK and a live 362-symbol export). The hand-written switch this replaces used the
+ * OLD ORDINALS and was wrong for most of the export:
+ *
+ *     CalcMode 1 (FUTURES)           shown as "Forex No Leverage"
+ *     CalcMode 5 (FOREX_NO_LEVERAGE) shown as "Exchange Stocks"   <- 54 symbols
+ *     CalcMode 6                     shown as "Exchange Futures"
+ *
+ * The fallback below is only used before the schema resolves; it carries the
+ * CORRECTED values, never the old ones.
+ */
+const CALC_MODE_FALLBACK: Record<number, string> = {
+    0: 'Forex',
+    1: 'Futures',
+    2: 'CFD',
+    3: 'CFD Index',
+    4: 'CFD Leverage',
+    5: 'Forex No Leverage',
+    32: 'Exchange Stocks',
+    33: 'Exchange Futures',
+    34: 'Exchange FORTS Futures',
+    35: 'Exchange Option',
+    36: 'Exchange Margin Option',
+    37: 'Exchange Bonds',
+    38: 'Exchange MOEX Stocks',
+    39: 'Exchange MOEX Bonds',
+    64: 'Collateral',
+};
+
+const CALC_MODE_LABELS: Record<string, string> = {
+    FOREX: 'Forex',
+    FUTURES: 'Futures',
+    CFD: 'CFD',
+    CFD_INDEX: 'CFD Index',
+    CFD_LEVERAGE: 'CFD Leverage',
+    FOREX_NO_LEVERAGE: 'Forex No Leverage',
+    EXCHANGE_STOCKS: 'Exchange Stocks',
+    EXCHANGE_FUTURES: 'Exchange Futures',
+    EXCHANGE_FUTURES_FORTS: 'Exchange FORTS Futures',
+    EXCHANGE_OPTIONS: 'Exchange Option',
+    EXCHANGE_OPTIONS_MARGIN: 'Exchange Margin Option',
+    EXCHANGE_BONDS: 'Exchange Bonds',
+    EXCHANGE_STOCKS_MOEX: 'Exchange MOEX Stocks',
+    EXCHANGE_BONDS_MOEX: 'Exchange MOEX Bonds',
+    SERV_COLLATERAL: 'Collateral',
+};
+
 function mapCalcMode(mode: any): string {
     if (typeof mode === 'number') {
-        switch (mode) {
-            case 0: return 'Forex';
-            case 1: return 'Forex No Leverage';
-            case 2: return 'CFD';
-            case 3: return 'CFD Index';
-            case 4: return 'CFD Leverage';
-            case 5: return 'Exchange Stocks';
-            case 6: return 'Exchange Futures';
-            case 7: return 'Exchange FORTS Futures';
-            case 8: return 'Exchange Bonds';
-            case 10: return 'Exchange Option';
-            case 14:
-            case 15: return 'CFD';
-            default: return 'Forex';
-        }
+        return CALC_MODE_FALLBACK[mode] ?? `CalcMode ${mode}`;
     }
     if (typeof mode === 'string') {
-        const u = mode.trim().toUpperCase();
-        if (u === '0' || (u.includes('FOREX') && !u.includes('NO_LEVERAGE'))) return 'Forex';
-        if (u === '1' || u.includes('FOREX_NO_LEVERAGE')) return 'Forex No Leverage';
-        if (u === '2' || u === 'CFD') return 'CFD';
-        if (u === '3' || u.includes('CFD_INDEX')) return 'CFD Index';
-        if (u === '4' || u.includes('CFD_LEVERAGE')) return 'CFD Leverage';
-        if (u === '5' || u.includes('EXCHANGE_STOCKS')) return 'Exchange Stocks';
-        if (u === '6' || u === 'EXCHANGE_FUTURES' || (u.includes('FUTURES') && !u.includes('FORTS'))) return 'Exchange Futures';
-        if (u === '7' || u.includes('FORTS')) return 'Exchange FORTS Futures';
-        if (u === '8' || u.includes('EXCHANGE_BONDS')) return 'Exchange Bonds';
-        if (u === '10' || u.includes('OPTION')) return 'Exchange Option';
-        if (u === '14' || u.includes('CRYPTO')) return 'CFD';
-        return mode;
+        const trimmed = mode.trim();
+        // A bare number arrives from some payloads.
+        if (/^-?\d+$/.test(trimmed)) {
+            return CALC_MODE_FALLBACK[Number(trimmed)] ?? `CalcMode ${trimmed}`;
+        }
+        const upper = trimmed.toUpperCase().replace(/[\s-]+/g, '_');
+        // Accept both MT5's enum member names and the label spellings.
+        if (CALC_MODE_LABELS[upper]) return CALC_MODE_LABELS[upper];
+        const byLabel = Object.values(CALC_MODE_LABELS)
+            .find(label => label.toUpperCase().replace(/[\s-]+/g, '_') === upper);
+        if (byLabel) return byLabel;
+        return trimmed;
     }
     return 'Forex';
 }
@@ -423,7 +459,6 @@ function mapPosition(p: any) {
     };
 }
 
-
 function mapDeal(d: any) {
     const actionStr = String(d.entry ?? d.action ?? 'in').toLowerCase();
     const isOut = actionStr.includes('out') || Number(d.entry) === 1 || Number(d.action) === 1;
@@ -516,35 +551,6 @@ const ORDER_STATE_LABEL: Record<string | number, string> = {
     3: 'CANCELED',
     4: 'REJECTED',
 };
-
-const BASE_PRICES: Record<string, { mid: number; spreadPts: number; digits: number }> = {
-    EURUSD: { mid: 1.0846, spreadPts: 1.2, digits: 5 },
-    GBPUSD: { mid: 1.3132, spreadPts: 1.5, digits: 5 },
-    USDJPY: { mid: 147.25, spreadPts: 1.4, digits: 3 },
-    BTCUSD: { mid: 84850.0, spreadPts: 15.0, digits: 2 },
-    ETHUSD: { mid: 2710.0, spreadPts: 2.0, digits: 2 },
-};
-
-function genTicksAround(symbol: string, around: string, fallbackPrice = 0): Array<{ time: string; bid: number; ask: number; last: number }> {
-    const base = BASE_PRICES[symbol] ?? { mid: fallbackPrice || 100, spreadPts: 2, digits: fallbackPrice > 1000 ? 2 : 4 };
-    const center = around ? new Date(around).getTime() : Date.now();
-    const out: Array<{ time: string; bid: number; ask: number; last: number }> = [];
-    let seed = (symbol || 'BTC').length * 7919 + 13;
-    const rnd = () => {
-        seed = (seed * 9301 + 49297) % 233280;
-        return seed / 233280;
-    };
-    const step = base.mid * 0.0002;
-    for (let i = -20; i <= 20; i++) {
-        const t = new Date(center + i * 450);
-        const mid = base.mid + (rnd() - 0.5) * 2 * step * 6 + (i * step) / 4;
-        const half = (base.spreadPts * Math.pow(10, -base.digits)) / 2;
-        const bid = Number((mid - half).toFixed(base.digits));
-        const ask = Number((mid + half).toFixed(base.digits));
-        out.push({ time: t.toISOString(), bid, ask, last: bid });
-    }
-    return out;
-}
 
 /** manager session token (JWT from /auth/login) kept for the Manager API calls */
 let managerToken: string | null = null;
@@ -1143,7 +1149,18 @@ export const liveApi: AdminApi = {
         }
 
         const opTimestamp = targetTime || new Date().toISOString();
-        const ticks = genTicksAround(targetSymbol || 'ETHUSD', opTimestamp, targetPrice);
+    // No price chart is drawn, because no tick history EXISTS on this server:
+    //   GET /api/v1/admin/history/ticks -> 501 NOT WIRED (ClickHouse decision pending)
+    //   GET /TickHistory                -> 200, 0 rows
+    //
+    // This previously called genTicksAround(), which built the chart from a hardcoded
+    // price table - EURUSD mid 1.0846 while the market was at 1.12531 - with nothing
+    // marking it as synthetic. An empty series plus a stated reason is honest; an
+    // invented chart is not.
+    const ticks: Array<{ time: string; bid: number; ask: number; last: number }> = []
+    const ticksUnavailable =
+        'Tick history is not stored on this server, so no price chart is available for '
+        + 'this operation.'
 
         return {
             kind,
@@ -1153,6 +1170,7 @@ export const liveApi: AdminApi = {
             chain,
             details,
             ticks,
+            ticks_unavailable: ticksUnavailable,
             journal: [
                 { time: opTimestamp, server: 'TradeServer', message: `'${targetLogin}': ${kind} #${id} ${title.split(' ').slice(1).join(' ')} requested` },
                 { time: opTimestamp, server: 'TradeServer', message: `'${targetLogin}': ${kind} #${id} executed at ${targetPrice}` },
@@ -1199,6 +1217,37 @@ export const liveApi: AdminApi = {
     },
     async checkMargin(params: { login: number; symbol: string; side: 'BUY' | 'SELL' | string; volume: number }) {
         return request('POST', '/admin/trade/check-margin', params);
+    },
+    /**
+     * The MT5 ConfigSymbols field descriptors the Symbol editor renders FROM.
+     *
+     * This is what removes the hardcoding: the tabs read their field list, their
+     * tab grouping and their dropdown options from here instead of declaring them
+     * in TypeScript. `enum_values` is expanded from the domain enums server-side,
+     * so an option list can never drift from what the API accepts.
+     */
+    async getSymbolSchema() {
+        return await request('GET', '/admin/symbols/schema');
+    },
+    /**
+     * The symbol's REAL trade/quote calendar (MT5's SessionsQuotes/SessionsTrades).
+     *
+     * The API answers with the same entity methods the pre-trade risk gate uses, so
+     * the UI and the server can never disagree about whether the market is open.
+     */
+    async getSymbolSessions(symbol: string) {
+        const lookup = symbol.endsWith('.dummy') ? symbol : (symbol.split('\\').pop() || symbol);
+        return await request('GET', `/admin/symbols/${encodeURIComponent(lookup)}/sessions`);
+    },
+    /**
+     * The symbol's MT5 fields that have no dedicated column - tick filtration, the
+     * per-day swap curve, the execution timeouts, the currency digits - under their
+     * stable JSON keys. Served from `GET /admin/symbols/{name}` as `fields`.
+     */
+    async getSymbolFields(symbol: string) {
+        const lookup = symbol.endsWith('.dummy') ? symbol : (symbol.split('\\').pop() || symbol);
+        const full = await request<any>('GET', `/admin/symbols/${encodeURIComponent(lookup)}`);
+        return full?.fields ?? {};
     },
     async createSymbol(data: any) {
         return await request('POST', '/admin/symbols', data);
@@ -1318,10 +1367,20 @@ export const liveApi: AdminApi = {
         for (const r of rows) {
             if (r.symbol) {
                 out[r.symbol] = {
-                    bid: num(r.bid),
-                    ask: num(r.ask),
-                    age: num(r.age_seconds),
+                    // null means "no price", and it must STAY null. `num(null)` returns 0,
+                    // which rendered a symbol with no tick as a 0.00 quote - an invented
+                    // price for an instrument we have never seen a price for.
+                    bid: r.bid != null ? num(r.bid) : (null as unknown as number),
+                    ask: r.ask != null ? num(r.ask) : (null as unknown as number),
+                    age: r.age_seconds != null ? num(r.age_seconds) : (null as unknown as number),
                     spread: r.spread != null ? num(r.spread) : undefined,
+                    // Market state comes from the SERVER, which derives it from the
+                    // symbol's real trading sessions - the same method the order gate
+                    // uses, so the badge and the trade decision cannot disagree.
+                    marketState: r.market_state,
+                    isMarketOpen: r.is_market_open,
+                    isTickStale: r.is_tick_stale,
+                    maxQuoteDelay: r.max_quote_delay,
                 };
             }
         }

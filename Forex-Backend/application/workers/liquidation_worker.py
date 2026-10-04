@@ -100,6 +100,15 @@ class LiquidationWorker:
         logger.info("LiquidationWorker stopped")
     
     async def _on_stop_out_entered(self, event: StopOutEntered) -> None:
+        # The margin level that TRIGGERED this stop-out, used for MT5's "[so XX%]" deal
+        # comment. Taken from the event payload so the comment states the level the server
+        # decided on, not one recomputed later after positions have already moved.
+        try:
+            payload = getattr(event, "payload", None) or {}
+            raw_level = payload.get("margin_level")
+            self._stop_out_level_pct = float(str(raw_level)) if raw_level is not None else None
+        except (TypeError, ValueError):
+            self._stop_out_level_pct = None
         """
         Handler for StopOutEntered events.
         
@@ -203,6 +212,21 @@ class LiquidationWorker:
             conversion_rates=conversion_rates,
         )
         
+        # --- MT5 step 1: release PENDING-order margin first ---------------
+        #
+        # "The terminal deletes a pending order with the largest margin reserved ...
+        #  Orders without a reserved margin are not deleted."
+        #
+        # This step did not exist, so a stop-out closed a POSITION even when cancelling a
+        # pending order would have restored the level. Cancelling costs the client nothing;
+        # closing realises a loss. MT5 does the cheap action first.
+        released = await self._release_pending_margin(account_login)
+        if released:
+            logger.info(
+                "stop-out for account %s cancelled %d pending order(s) to release margin",
+                account_login, released,
+            )
+
         if not plan.positions_to_close:
             logger.info(f"No positions need to be closed for account {account_login}")
             return
@@ -280,6 +304,76 @@ class LiquidationWorker:
             f"equity={account.equity.amount}"
         )
     
+    async def _release_pending_margin(self, account_login: int) -> int:
+        """Cancel pending orders, largest reserved margin first, while below stop-out.
+
+        MT5's first stop-out action, and the one that costs the client least: a pending
+        order holds margin but has no position and no unrealised loss, so cancelling it can
+        restore the level without closing anything.
+
+        Returns the number of orders cancelled. Re-reads the account before each
+        cancellation so it stops as soon as the level is restored rather than cancelling
+        everything.
+
+        "Orders without a reserved margin are not deleted" - an order whose reserved_margin
+        is zero or absent is skipped, per the doc.
+        """
+        cancelled = 0
+        for _ in range(50):                      # bounded: never loop forever
+            orders = await self._open_pending_orders(account_login)
+            if not orders:
+                return cancelled
+
+            def reserved(order):
+                value = getattr(order, "reserved_margin", None)
+                return getattr(value, "amount", value) or 0
+
+            candidates = [o for o in orders if reserved(o) and reserved(o) > 0]
+            if not candidates:
+                return cancelled
+
+            target = max(candidates, key=reserved)
+
+            # Stop as soon as the level is healthy again.
+            account = await self.account_repo.find_by_login(str(account_login))
+            if account is None:
+                return cancelled
+            stop_out_level = getattr(account, "stop_out_level", None)
+            if stop_out_level is not None:
+                try:
+                    if account.margin_level().percentage > Decimal(str(stop_out_level)):
+                        return cancelled
+                except Exception:                 # noqa: BLE001 - cannot judge; keep going
+                    pass
+
+            try:
+                target.cancel("stop-out: released reserved margin")
+                await self.order_repo.save(target)
+                cancelled += 1
+                logger.info("stop-out released pending order %s (reserved %s)",
+                            getattr(target, "ticket_id", "?"), reserved(target))
+            except Exception as exc:              # noqa: BLE001
+                logger.error("could not cancel pending order during stop-out: %s", exc)
+                return cancelled
+        return cancelled
+
+    async def _open_pending_orders(self, account_login: int) -> list:
+        """Open pending orders for an account, or [] when the repository cannot say."""
+        for name in ("get_open_orders", "get_pending_orders", "find_pending_orders"):
+            getter = getattr(self.order_repo, name, None)
+            if getter is None:
+                continue
+            try:
+                result = getter(str(account_login))
+                if hasattr(result, "__await__"):
+                    result = await result
+                return [o for o in (result or [])
+                        if not getattr(o, "is_market", lambda: True)()]
+            except Exception as exc:              # noqa: BLE001
+                logger.error("could not list pending orders for %s: %s", account_login, exc)
+                return []
+        return []
+
     async def _close_position(
         self,
         account: Account,
@@ -317,7 +411,12 @@ class LiquidationWorker:
             price_order=current_price,
             state=OrderState.FILLED,
             reason="LIQUIDATION",
-            comment=f"[LIQUIDATION] Closing position {position.position_id}",
+            # MT5 marks a stop-out deal "[so XX%]", where XX is the margin level at which
+            # the stop-out occurred. The previous "[LIQUIDATION] ..." string could not be
+            # recognised as a stop-out by a client, a report, or the compensation logic.
+            comment=(f"[so {self._stop_out_level_pct:.0f}%]"
+                     if getattr(self, "_stop_out_level_pct", None) is not None
+                     else "[so]") + f" closing {position.position_id}",
         )
         
         await self.order_repo.save(closing_order)
@@ -336,7 +435,7 @@ class LiquidationWorker:
             profit=position.profit,  # Realized PnL
             swap=position.swap,
             commission=position.commission,
-            comment=f"[LIQUIDATION] {closing_order.comment}",
+            comment=closing_order.comment,
         )
         
         await self.deal_repo.save(closing_deal)

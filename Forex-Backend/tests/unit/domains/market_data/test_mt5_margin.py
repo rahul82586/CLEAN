@@ -519,3 +519,332 @@ def test_available_margin_goes_negative_when_underwater():
     """A negative number is the signal; clamping it to zero hides the stop-out."""
     result = available_margin(equity=Decimal("1000"), margin_used=Decimal("5000"))
     assert result == Decimal("-4000")
+
+
+# ---------------------------------------------------------------------------
+# Every remaining CalcMode, and the Fixed Margin rule
+#
+# Added because `basic_margin` implemented 5 of MT5's 15 modes and let the other 10
+# fall through to the Forex formula. Nine returned a plausible wrong number; CFD Index
+# raised "not implemented"; Collateral charged margin that MT5 deliberately does not
+# charge; and the Fixed Margin rule missed MT5's "except for Forex and CFD Leverage,
+# the leverage is additionally considered", over-charging those two by the account
+# leverage (100x at 1:100).
+#
+# Expectations are MT5's published formulas and arithmetic. Parameters are chosen so
+# each mode's answer DIFFERS from the others - a wrong branch passing by coincidence is
+# precisely how `mode 1 FUTURES -> 0` looked correct before.
+# ---------------------------------------------------------------------------
+
+
+def _mode_spec(mode, **kw):
+    """A SymbolMarginSpec with the tick/face inputs the newer modes need."""
+    from decimal import Decimal as D
+    return SymbolMarginSpec(name=kw.pop("name", f"MODE{mode}"), calc_mode=mode, **kw)
+
+
+def test_cfd_index_multiplies_by_the_tick_ratio():
+    """`Volume in lots * Contract size * Open market price * Tick value / Tick size`."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="US500", contract_size=D("100"), calc_mode=3,
+                            tick_value=D("0.5"), tick_size=D("0.25"))
+    # 1 * 100 * 200 * (0.5/0.25) = 40000
+    assert basic_margin(spec, D("1"), D("200"), leverage=100) == D("40000")
+
+
+def test_cfd_index_refuses_when_tick_size_is_zero():
+    """A ratio of 1.0 would be a guess; TickSize is genuinely 0 on most symbols."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="US500", contract_size=D("100"), calc_mode=3,
+                            tick_value=D("1"), tick_size=D("0"))
+    with pytest.raises(MarginCalculationError):
+        basic_margin(spec, D("1"), D("200"), leverage=100)
+
+
+def test_exchange_stocks_use_the_stock_formula_not_forex():
+    """`Volume in lots * Contract size * Open market price` - used to fall through to Forex."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="AAPL", contract_size=D("100"), calc_mode=32)
+    # 1 * 100 * 50 = 5000, NOT 1*100/100 = 1
+    assert basic_margin(spec, D("1"), D("50"), leverage=100) == D("5000")
+
+
+def test_moex_stocks_use_the_same_formula():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="SBER", contract_size=D("10"), calc_mode=38)
+    assert basic_margin(spec, D("2"), D("300"), leverage=100) == D("6000")
+
+
+def test_exchange_bonds_use_face_value_percentage():
+    """`Volume * Contract size * Face value * Open price / 100` - the quote IS the percent."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="OFZ", contract_size=D("10"), calc_mode=37,
+                            face_value=D("1000"))
+    # 1 * 10 * 1000 * 95 / 100 = 9500
+    assert basic_margin(spec, D("1"), D("95"), leverage=100) == D("9500")
+
+
+def test_moex_bonds_use_the_same_formula():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="OFZ", contract_size=D("10"), calc_mode=39,
+                            face_value=D("1000"))
+    assert basic_margin(spec, D("1"), D("95"), leverage=100) == D("9500")
+
+
+def test_bonds_refuse_without_a_face_value_rather_than_guess():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="OFZ", contract_size=D("10"), calc_mode=37)
+    with pytest.raises(MarginCalculationError):
+        basic_margin(spec, D("1"), D("95"), leverage=100)
+
+
+def test_collateral_charges_no_margin_at_all():
+    """"For these instruments the margin is not calculated." Was charged the Forex formula."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="GOLD-ASSET", contract_size=D("100"), calc_mode=64)
+    assert basic_margin(spec, D("10"), D("100"), leverage=100) == D("0")
+
+
+def test_exchange_options_use_initial_margin_when_set():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="OPT", contract_size=D("100"), calc_mode=35,
+                            margin_initial=D("2000"))
+    assert basic_margin(spec, D("1"), D("100"), leverage=100) == D("2000")
+
+
+def test_exchange_options_fall_back_to_notional_when_no_margin_is_set():
+    """`if both margins 0 -> Volume in lots * Contract size * Open price`."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="OPT", contract_size=D("100"), calc_mode=35)
+    assert basic_margin(spec, D("1"), D("100"), leverage=100) == D("10000")
+
+
+def test_exchange_futures_use_the_fixed_initial_margin():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="BR", contract_size=D("100"), calc_mode=33,
+                            margin_initial=D("7500"))
+    assert basic_margin(spec, D("2"), D("100"), leverage=100) == D("15000")
+
+
+def test_forts_takes_the_larger_side_off_the_settlement_price():
+    """MarginBuy = Vol*(Initial + (Open-Settle)*TV/TS*(1+0.01*CMR)), then MAX(buy, sell).
+
+    Long, Initial 1000, settlement 100, open 105, TV/TS = 2:
+        buy  = +1 * (1000 + (105-100)*2) = 1010
+        sell = -1 * (1000 + (100-105)*2) = -990
+        MAX  = 1010
+    """
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="BR-12.18", contract_size=D("1"), calc_mode=34,
+                            margin_initial=D("1000"), tick_value=D("0.5"),
+                            tick_size=D("0.25"), settlement_price=D("100"))
+    assert basic_margin(spec, D("1"), D("105"), leverage=100, side="BUY") == D("1010")
+
+
+def test_forts_short_position_uses_the_other_side():
+    """"The volume is used with a positive sign for short positions" in the Sell formula."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="BR-12.18", contract_size=D("1"), calc_mode=34,
+                            margin_initial=D("1000"), tick_value=D("0.5"),
+                            tick_size=D("0.25"), settlement_price=D("100"))
+    # buy = -1*1010 = -1010 ; sell = +1*(1000 + (100-105)*2) = 990 -> MAX = 990
+    assert basic_margin(spec, D("1"), D("105"), leverage=100, side="SELL") == D("990")
+
+
+def test_forts_refuses_without_a_settlement_price():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="BR-12.18", contract_size=D("1"), calc_mode=34,
+                            margin_initial=D("1000"), tick_value=D("0.5"),
+                            tick_size=D("0.25"))
+    with pytest.raises(MarginCalculationError):
+        basic_margin(spec, D("1"), D("105"), leverage=100)
+
+
+def test_fixed_margin_still_divides_by_leverage_for_forex():
+    """MT5: "For Forex and CFD Leverage calculation types, the leverage is
+    additionally considered: Volume in lots * Initial margin / Leverage".
+
+    This is the defect: the code returned `volume * Initial` for every mode, so a
+    Forex symbol with a fixed Initial margin of 5000 was charged 5000 instead of 50
+    at 1:100.
+    """
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="EURUSD", contract_size=D("100000"), calc_mode=0,
+                            margin_initial=D("5000"))
+    assert basic_margin(spec, D("1"), D("100"), leverage=100) == D("50")
+    assert basic_margin(spec, D("1"), D("100"), leverage=500) == D("10")
+
+
+def test_fixed_margin_still_divides_by_leverage_for_cfd_leverage():
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="CFDX", contract_size=D("5000"), calc_mode=4,
+                            margin_initial=D("5000"))
+    assert basic_margin(spec, D("1"), D("100"), leverage=100) == D("50")
+
+
+def test_fixed_margin_ignores_leverage_for_every_other_mode():
+    """"for all types of calculations (except for Forex and CFD Leverage), the margin
+    is obtained as if Futures: Volume in lots * Initial margin"."""
+    from decimal import Decimal as D
+    for mode in (1, 2, 3, 5, 32, 33, 35, 37, 38, 39):
+        spec = SymbolMarginSpec(name=f"MODE{mode}", contract_size=D("100"), calc_mode=mode,
+                                margin_initial=D("5000"), tick_value=D("1"),
+                                tick_size=D("1"), face_value=D("100"))
+        assert basic_margin(spec, D("1"), D("100"), leverage=100) == D("5000"), mode
+
+
+def test_an_unknown_calc_mode_is_refused_rather_than_becoming_forex():
+    """A silent fallback would understate or overstate margin with nothing to show."""
+    from decimal import Decimal as D
+    spec = SymbolMarginSpec(name="MYSTERY", contract_size=D("100"), calc_mode=99)
+    with pytest.raises(MarginCalculationError):
+        basic_margin(spec, D("1"), D("100"), leverage=100)
+
+
+# ---------------------------------------------------------------------------
+# The volume unit contract
+#
+# The columns hold MT5's scaled WIRE INTEGER (VolumeMin = 100 for 0.01 lots), while the
+# API and the engine speak LOTS. `db_to_symbol` divides by 10^4 on read. The PUT used to
+# write lots straight into the column, so every volume edited through the API was
+# stored 10^4 too small - ETHUSD ended up with the engine seeing a 0.1-lot maximum on a
+# symbol the server allows 1000 lots on, and a 1-lot order was rejected.
+#
+# Both directions are asserted. Checking only the conversion would pass with a matching
+# pair of opposite errors; the round trip is what proves the pair agrees.
+# ---------------------------------------------------------------------------
+
+
+def test_volume_to_wire_multiplies_lots_by_the_wire_exponent():
+    from infrastructure.mt5.codec import VOLUME_WIRE_EXPONENT
+    from api.routers.admin.skeletons import _volume_to_wire
+    from decimal import Decimal as D
+
+    assert VOLUME_WIRE_EXPONENT == 4, "the contract below assumes the 10^4 wire form"
+    assert _volume_to_wire("0.01") == D("100")
+    assert _volume_to_wire(D("100")) == D("1000000")
+    assert _volume_to_wire(1000) == D("10000000")
+    assert _volume_to_wire(0) == D("0")
+
+
+def test_volume_round_trip_is_lossless():
+    """lots -> column -> reader -> the same lots. This is what actually broke."""
+    from decimal import Decimal as D
+    from api.routers.admin.skeletons import _volume_to_wire
+    from infrastructure.mt5.codec import record_to_domain
+    from infrastructure.mt5 import fieldmap
+
+    for lots in ("0.01", "0.1", "1", "100", "1000"):
+        column = str(_volume_to_wire(lots))
+        domain = record_to_domain(
+            {"VolumeMin": column, "VolumeMax": column, "VolumeStep": column},
+            fieldmap.SYMBOL_FIELDS,
+        )
+        assert domain["volume_min"] == D(lots), f"{lots} lots did not survive the round trip"
+
+
+def test_the_columns_of_a_real_symbol_hold_the_wire_form():
+    """A symbol whose column is correct, asserted so the contract cannot drift silently.
+
+    EURUSD's export wire values are VolumeMin 100, VolumeMax 100000, i.e. 0.01 and 10
+    lots. If the storage convention ever changes, this fails rather than quietly
+    re-interpreting every stored volume.
+    """
+    from decimal import Decimal as D
+    from infrastructure.mt5.codec import record_to_domain
+    from infrastructure.mt5 import fieldmap
+
+    domain = record_to_domain(
+        {"VolumeMin": "100", "VolumeMax": "100000", "VolumeStep": "100"},
+        fieldmap.SYMBOL_FIELDS,
+    )
+    assert domain["volume_min"] == D("0.01")
+    assert domain["volume_max"] == D("10")
+    assert domain["volume_step"] == D("0.01")
+
+
+# ---------------------------------------------------------------------------
+# Hedging: the "larger leg" method
+#
+# MT5 ("Calculate hedged margin using larger leg"):
+#     "per-side values (longer leg + long pendings vs shorter leg + short pendings)
+#      ... The largest one of all calculated values is used as the final margin value."
+#
+# The setting was stored, round-tripped and exposed but never read, so this path was dead
+# code that returned the BASIC answer. A test that only checked it runs would therefore
+# have passed against the broken code - these assert the two methods actually DIFFER.
+# ---------------------------------------------------------------------------
+
+
+def _hedged_case(use_larger_leg: bool):
+    """One BUY position and one SELL pending, so the two methods MUST disagree."""
+    from decimal import Decimal as D
+    from core.domains.market_data.margin import (
+        Leg, SymbolMarginSpec, calculate_account_margin,
+    )
+
+    spec = SymbolMarginSpec(
+        name="EURUSD", contract_size=D("100000"), calc_mode=0,
+        margin_currency="USD", hedged_use_larger_leg=use_larger_leg,
+    )
+    legs = [
+        Leg(symbol="EURUSD", operation="BUY", volume=D("1"), price=D("1.10")),
+        Leg(symbol="EURUSD", operation="SELL", volume=D("0.5"), price=D("1.10"),
+            is_pending=True),
+    ]
+    return calculate_account_margin(
+        legs, specs={"EURUSD": spec}, deposit_currency="USD",
+        rate_lookup=None, leverage=100,
+    )
+
+
+def test_larger_leg_differs_from_basic_when_a_pending_sits_on_the_smaller_side():
+    """A test that only asserted "it runs" would pass against the BROKEN code, because the
+    broken code ignored the setting and returned the Basic answer. These must differ."""
+    basic = _hedged_case(False)
+    larger = _hedged_case(True)
+    assert basic.total != larger.total, (
+        "both methods returned the same total, so the setting is still ignored"
+    )
+    assert larger.total <= basic.total
+
+
+def test_larger_leg_equals_the_largest_side():
+    """MT5: "The largest one of all calculated values is used as the final margin value"."""
+    from decimal import Decimal as D
+    from core.domains.market_data.margin import (
+        SymbolMarginSpec, apply_rate, basic_margin,
+    )
+
+    accounted = _hedged_case(True)
+    spec = SymbolMarginSpec(
+        name="EURUSD", contract_size=D("100000"), calc_mode=0,
+        margin_currency="USD", hedged_use_larger_leg=True,
+    )
+    long_side = apply_rate(basic_margin(spec, D("1"), D("1.10"), leverage=100),
+                           spec, "BUY", False)
+    short_side = apply_rate(basic_margin(spec, D("0.5"), D("1.10"), leverage=100),
+                            spec, "SELL", False)
+    expected = max(long_side, short_side)
+    assert accounted.total == expected, f"{accounted.total} != max(sides) {expected}"
+
+
+def test_the_two_methods_agree_with_no_pendings():
+    """An unhedged case must be untouched by this change."""
+    from decimal import Decimal as D
+    from core.domains.market_data.margin import (
+        Leg, SymbolMarginSpec, calculate_account_margin,
+    )
+
+    def total(use_larger_leg: bool):
+        spec = SymbolMarginSpec(
+            name="EURUSD", contract_size=D("100000"), calc_mode=0,
+            margin_currency="USD", hedged_use_larger_leg=use_larger_leg,
+        )
+        legs = [Leg(symbol="EURUSD", operation="BUY", volume=D("1"), price=D("1.10"))]
+        return calculate_account_margin(
+            legs, specs={"EURUSD": spec}, deposit_currency="USD",
+            rate_lookup=None, leverage=100,
+        ).total
+
+    assert total(False) == total(True)

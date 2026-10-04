@@ -985,6 +985,94 @@ async def handle_PositionModify_get(
     )
 
 
+async def _enforce_manager_risk_gates(
+    *,
+    target_symbol: str,
+    target_login: str,
+    operation: str,
+    lots: float,
+    price: Any,
+    symbol_repo: Any,
+    account_repo: Any,
+) -> None:
+    """Run the pre-trade risk gates for a manager order. Raises HTTPException on refusal.
+
+    F-08. This handler previously went from a quote straight to the LP, so every gate the
+    CLIENT path enforces was skipped for manager orders: trading sessions, holidays, the
+    symbol/group permission, the can-trade check, margin, and MT5's Max quote delay.
+
+    It builds the same objects the client builds and calls the SAME validate_order, rather
+    than re-implementing the checks, because a second copy of a rule is what has gone
+    stale repeatedly in this codebase.
+
+    A missing repository is NOT treated as approval. If the gate cannot run, allowing the
+    order would reopen the hole this function exists to close.
+    """
+    from decimal import Decimal as _Decimal
+
+    from api.di_providers import get_risk_engine
+    from application.services.risk_service import PreTradeRiskService
+    from core.domains.common.value_objects import Volume
+    from core.domains.oms.entities.order import Order
+    from core.domains.oms.enums import OrderReason, OrderType
+
+    symbol = await symbol_repo.find_by_name(target_symbol) if symbol_repo else None
+    if symbol is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Trade rejected: unknown symbol {target_symbol}",
+        )
+
+    account = await account_repo.find_by_login(str(target_login)) if account_repo else None
+    if account is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Trade rejected: unknown account {target_login}",
+        )
+
+    service = PreTradeRiskService(
+        risk_engine=get_risk_engine(),
+        symbol_repo=symbol_repo,
+        account_repo=account_repo,
+    )
+
+    # Direction lives in the ORDER TYPE - the entity has no `side` field, matching MT5.
+    is_buy = str(operation).upper().startswith("B")
+    volume = Volume(_Decimal(str(lots)))
+    order = Order(
+        account_login=str(target_login),
+        symbol=target_symbol,
+        order_type=OrderType.BUY if is_buy else OrderType.SELL,
+        reason=OrderReason.DEALER,      # a manager/dealer order, per MT5's own reasons
+        volume_initial=volume,
+        volume_current=volume,
+    )
+
+    # `validate_order` expects a Price VALUE OBJECT - the client path supplies one and
+    # the margin step reads `price.value`. Passing a bare Decimal raised
+    # AttributeError and returned HTTP 500 once the earlier gates let the order through.
+    from core.domains.common.value_objects import Price as _Price
+
+    approved = await service.validate_order(
+        order=order,
+        account=account,
+        symbol=symbol,
+        current_price=_Price(_Decimal(str(price))) if price is not None else None,
+        publish_events=False,
+    )
+    if approved:
+        return
+
+    reason = getattr(service, "last_rejection_reason", None) or "pre-trade risk check failed"
+    code = getattr(service, "last_rejection_code", None)
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"Trade rejected: {reason}"
+            + (f" (retcode {int(code)})" if code is not None else "")
+        ),
+    )
+
 @router.get("/OrderSend", summary="Send market or pending order")
 @router_root.get("/OrderSend", summary="Send market or pending order")
 @router.post("/OrderSend", summary="Send market or pending order (POST format)")
@@ -1099,6 +1187,27 @@ async def handle_OrderSend_get(
                 sym_digits = sym_obj.digits
         except Exception:
             pass
+
+    # ------------------------------------------------------------------
+    # PRE-TRADE RISK GATES (F-08)
+    #
+    # This handler used to go straight from a quote to the LP: no session check, no
+    # holiday check, no symbol permission, no can-trade check, no margin check, no
+    # quote-delay check. The client path ran all of them, so a manager order was the one
+    # way to trade a closed market, or a symbol the group may not use.
+    #
+    # Runs BEFORE routing and before any row is written, so a rejection leaves no LP
+    # exposure, no order, no deal and no position behind.
+    # ------------------------------------------------------------------
+    await _enforce_manager_risk_gates(
+        target_symbol=target_symbol,
+        target_login=target_login,
+        operation=operation,
+        lots=float(volume),
+        price=exec_price,
+        symbol_repo=symbol_repo,
+        account_repo=account_repo,
+    )
 
     # Retrieve account & determine automatic group routing
     acc = None

@@ -52,7 +52,7 @@ Documented gaps (deliberate, not silent):
 import asyncio
 import inspect
 import logging
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Any, Dict, Optional
 
@@ -71,6 +71,8 @@ from core.ports.interfaces import (
     IPositionRepository,
     ISymbolRepository,
 )
+
+from core.domains.instruments.enums import SymbolSwapFlags as SwapFlags
 
 logger = logging.getLogger(__name__)
 
@@ -186,10 +188,149 @@ class SwapWorker:
         mt5_day = (now.weekday() + 1) % 7  # Sun=0 .. Sat=6
         if mt5_day in (0, 6):
             return Decimal("0")
+
+        triple = getattr(symbol, "swap_3day", None)
+        base = Decimal("3") if (triple is not None and int(triple) == mt5_day) else Decimal("1")
+
+        # --- MT5's "Automatically consider holidays" ----------------------
+        #
+        # "The day before the holiday, the swap is doubled. No swap is charged on the day
+        #  of the holiday."
+        #
+        # Applied only when the symbol carries SWAP_FLAGS_CONSIDER_HOLIDAYS AND a holiday
+        # list is actually available. Guessing would change every swap on the book, which
+        # is far worse than leaving a known gap, so the absence of holidays leaves the
+        # weekday rule exactly as it was.
+        holiday = self._holiday_multiplier(symbol, now)
+        if holiday is None:
+            return base
+        if holiday["today"]:
+            # "No swap will be charged on Wednesday as it is a holiday."
+            return Decimal("0")
+        if holiday["before"] > 0:
+            # "a sum of the multipliers of the current day and of the holiday" - and of
+            # every consecutive holiday inside the run, per the multiple-holiday note.
+            return base + Decimal(holiday["before"])
+        return base
+
+    def _holiday_multiplier(self, symbol: Any, now: datetime) -> Optional[Dict[str, Any]]:
+        """Holiday context for a swap, or None when the rule cannot be applied.
+
+        Returns ``{"today": bool, "before": int}`` where ``before`` is the number of
+        holiday multipliers that must be charged ON THIS DAY because the holiday (or run of
+        holidays) starts tomorrow.
+
+        The holiday's own weekday multiplier is used, per the doc: "The calculations still
+        use the swap multipliers specified for the corresponding days." A holiday falling on
+        a Monday therefore contributes Monday's multiplier, not 1.
+        """
+        # Only symbols that opted in are affected.
+        flags = getattr(symbol, "swap_flags", None)
+        if flags is None:
+            extra = getattr(symbol, "mt5_extra", None) or {}
+            flags = extra.get("SwapFlags")
+        # `flags` may be an IntFlag INSTANCE, an int, or a numeric string - the same three
+        # shapes the rest of this codebase handles. `int(flags or 0)` on an IntFlag raises
+        # TypeError, and an earlier version of this caught that and quietly set
+        # consider=False: the holiday rule then never applied and nothing said so.
+        raw_flags = getattr(flags, "value", flags)
+        try:
+            consider = bool(int(raw_flags or 0) & int(SwapFlags.CONSIDER_HOLIDAYS))
+        except (TypeError, ValueError) as exc:
+            # Log it. A silent fallback here disables a documented MT5 rule on every
+            # symbol, which is exactly the class of defect this workstream keeps finding.
+            logger.warning(
+                "swap: could not read SwapFlags %r for %s (%s); holiday rule NOT applied",
+                flags, getattr(symbol, "name", "?"), exc,
+            )
+            consider = False
+        if not consider:
+            return None
+
+        holidays = self._holidays_for(symbol)
+        if holidays is None:
+            return None                       # unknown: leave the weekday rule alone
+
+        today = now.date()
+
+        def is_holiday(day) -> bool:
+            return day in holidays
+
+        if is_holiday(today):
+            return {"today": True, "before": 0}
+
+        # The day before a RUN of holidays sums the whole run.
+        tomorrow = today + timedelta(days=1)
+        if not is_holiday(tomorrow):
+            return {"today": False, "before": 0}
+
+        total = 0
+        cursor = tomorrow
+        for _ in range(30):                   # bounded: a run longer than 30 days is a data error
+            if not is_holiday(cursor):
+                break
+            total += int(self._weekday_multiplier_for(symbol, cursor))
+            cursor += timedelta(days=1)
+        return {"today": False, "before": total}
+
+    @staticmethod
+    def _weekday_multiplier_for(symbol: Any, day) -> Decimal:
+        """The plain weekday/triple multiplier for a DATE, ignoring holidays.
+
+        Weekends are 0, which is why a holiday that begins on a Monday contributes
+        Friday's multiplier rather than Saturday's zero - the rollover that would have been
+        charged before the closure.
+        """
+        mt5_day = (day.weekday() + 1) % 7
+        if mt5_day in (0, 6):
+            return Decimal("0")
         triple = getattr(symbol, "swap_3day", None)
         if triple is not None and int(triple) == mt5_day:
             return Decimal("3")
         return Decimal("1")
+
+    def _holidays_for(self, symbol: Any) -> Optional[set]:
+        """Dates this symbol is closed for, or None when that cannot be determined.
+
+        Reads whatever the worker was given. A missing repository returns None rather than
+        an empty set, because "no holidays configured" and "cannot tell" must behave
+        differently: the first is a real answer, the second means keep the old behaviour.
+        """
+        repo = getattr(self, "holiday_repo", None)
+        if repo is None:
+            return None
+
+        cache: Optional[set] = getattr(self, "_holiday_date_cache", None)
+        if cache is not None:
+            return cache
+
+        getter = getattr(repo, "get_all", None) or getattr(repo, "get_all_holidays", None)
+        if getter is None:
+            return None
+        try:
+            rows = getter()
+        except Exception:                     # noqa: BLE001
+            return None
+
+        out: set = set()
+        name = getattr(symbol, "name", "")
+        for holiday in rows or []:
+            if getattr(holiday, "mode", None) is not None:
+                try:
+                    if int(getattr(holiday.mode, "value", holiday.mode)) != 1:
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            symbols = getattr(holiday, "symbols", None) or []
+            if symbols and name not in symbols:
+                continue                      # configured for other instruments
+            for attr in ("date", "day"):
+                value = getattr(holiday, attr, None)
+                if value is not None:
+                    out.add(value.date() if hasattr(value, "date") and not isinstance(value, date) else value)
+                    break
+        self._holiday_date_cache = out
+        return out
 
     async def _symbol_for(self, name: str) -> Optional[Any]:
         getter = getattr(self.symbol_repo, "get_symbol", None)

@@ -149,7 +149,31 @@ class PreTradeRiskService:
                     await self._publish_rejection(order, reason)
                 return False
 
-            # 4a. Holiday Check.
+            # 4a. Maximum quote delay (MT5 Trade tab, `QuotesTimeout`).
+            #
+            # "time (in seconds) of delay in the receipt of quotes, after which trading
+            # will be automatically disabled for this symbol. As quotes start coming
+            # again, trade will be enabled automatically."
+            #
+            # Per symbol, and both directions are automatic: nothing has to be reset when
+            # the feed resumes, because the comparison is against the CURRENT tick age.
+            #
+            # Rejected as MARKET_CLOSED because that is what MT5 does - it disables
+            # trading for the symbol rather than reporting a pricing fault - and a client
+            # sees the same outcome either way.
+            #
+            # Placed here, next to the session check, because both ask "is this symbol
+            # tradeable right now?" and MT5's pipeline treats them together.
+            delay_reason = await self._check_max_quote_delay(symbol, _now)
+            if delay_reason is not None:
+                logger.warning(f"Order {order.ticket_id} rejected: {delay_reason}")
+                self.last_rejection_reason = delay_reason
+                self.last_rejection_code = Retcode.MARKET_CLOSED
+                if publish_events:
+                    await self._publish_rejection(order, delay_reason)
+                return False
+
+            # 4b. Holiday Check.
             # MT5 request-processing pipeline: "request time not on a holiday".
             # The instruments domain has carried Holiday since M2 and nothing ever
             # consulted it during order validation, so a configured holiday did not
@@ -277,6 +301,127 @@ class PreTradeRiskService:
                         order.reserved_margin = Decimal("0")
                     raise
             return True
+
+    async def _check_max_quote_delay(self, symbol: Any, now: Any) -> Optional[str]:
+        """MT5's per-symbol maximum quote delay. Returns a reason, or None to allow.
+
+        `QuotesTimeout` is in SECONDS. A value of 0 means "no limit" and is the common
+        case in the reference export - read literally it would disable trading within a
+        second of the last tick, so it is treated as disabled.
+
+        This is deliberately NOT wired to the global `*_TICK_AGE_SECONDS` settings. Those
+        are ours and answer "may this quote be used at all"; this answers MT5's separate
+        question of "is trading enabled for this symbol right now". Mixing them would
+        make a per-symbol setting behave globally.
+
+        A symbol with NO tick at all is refused when a delay is configured: MT5 disables
+        trading on a symbol whose quotes have not arrived, and "never arrived" is the
+        extreme case of that, not an exemption from it.
+        """
+        timeout = self._symbol_quote_timeout(symbol)
+        if timeout <= 0:
+            return None                      # 0 disables the check
+
+        tick = await self._latest_tick(symbol.name)
+        if tick is None:
+            return (
+                f"{symbol.name} has no live quote and Max quote delay is "
+                f"{timeout}s - trading is disabled for this symbol until quotes arrive"
+            )
+
+        age = self._tick_age_seconds(tick, now)
+        if age is None:
+            return None                      # no timestamp to judge against
+        if age > timeout:
+            return (
+                f"{symbol.name} quote is {age:.0f}s old, beyond its Max quote delay of "
+                f"{timeout}s - trading is disabled for this symbol until quotes resume"
+            )
+        return None
+
+    @staticmethod
+    def _symbol_quote_timeout(symbol: Any) -> float:
+        """`QuotesTimeout` in seconds, from the entity or its mt5_extra quarantine."""
+        import os as _os
+
+        raw = getattr(symbol, "quotes_timeout", None)
+        if raw is None:
+            extra = getattr(symbol, "mt5_extra", None) or {}
+            raw = extra.get("QuotesTimeout")
+        if raw is None:
+            # Not configured on the symbol: fall back to the environment so a deployment
+            # can impose a floor, but default to disabled to match the export.
+            raw = _os.environ.get("DEFAULT_MAX_QUOTE_DELAY_SECONDS", "0")
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _market_data_engine(self) -> Any:
+        """The market-data engine, from wherever this service actually holds it.
+
+        `PreTradeRiskService` does NOT own one - its `__init__` takes only
+        event_bus, position_repo, risk_engine, symbol_repo and account_repo. The engine
+        hangs off the RISK engine:
+
+            RiskEngine.__init__(..., market_data_engine=None)
+            -> self.market_data_engine
+
+        The first version of this looked only at `self.market_data_engine` and
+        `self.engine`, which a real service never has, so the tick lookup always missed.
+        Reads the direct attribute too, so a service or a test that sets one is still
+        honoured.
+        """
+        for holder in (self, getattr(self, "risk_engine", None)):
+            if holder is None:
+                continue
+            engine = getattr(holder, "market_data_engine", None)
+            if engine is not None:
+                return engine
+            engine = getattr(holder, "engine", None)
+            # `engine` on the risk engine is the RiskEngine itself, not a feed, so only
+            # accept it when it actually exposes a tick lookup.
+            if engine is not None and hasattr(engine, "get_latest_tick"):
+                return engine
+        return None
+
+    async def _latest_tick(self, symbol_name: str) -> Any:
+        """The engine's latest tick for a symbol, or None."""
+        engine = self._market_data_engine()
+        if engine is None:
+            return None
+        getter = getattr(engine, "get_latest_tick", None)
+        if getter is None:
+            return None
+        try:
+            result = getter(symbol_name)
+            if hasattr(result, "__await__"):
+                result = await result
+            return result
+        except Exception:                                  # noqa: BLE001
+            # A missing feed must not turn into a crash on the order path; the global
+            # freshness guard still applies where it is configured.
+            return None
+
+    @staticmethod
+    def _tick_age_seconds(tick: Any, now: Any) -> Optional[float]:
+        """Seconds since the tick's timestamp, or None if it carries no usable one."""
+        stamp = None
+        for attr in ("timestamp", "time", "ts"):
+            stamp = getattr(tick, attr, None)
+            if stamp is not None:
+                break
+        if stamp is None and isinstance(tick, dict):
+            stamp = tick.get("timestamp") or tick.get("time")
+        if stamp is None:
+            return None
+        try:
+            if getattr(stamp, "tzinfo", None) is None:
+                from datetime import timezone as _tz
+                stamp = stamp.replace(tzinfo=_tz.utc)
+            return max(0.0, (now - stamp).total_seconds())
+        except (TypeError, ValueError):
+            return None
 
     async def _check_holiday(self, symbol_name: str, now: Any) -> Optional[str]:
         """Return the holiday description when `now` falls on a configured holiday.
@@ -641,7 +786,11 @@ class PreTradeRiskService:
 
         # 3. Stages 1-3. A market order with no price raises rather than defaulting to
         #    1.0 - that default understated JPY margin by ~150x.
-        price_value = price.value if price is not None else None
+        # Accepts a Price value object OR a raw number. Every existing caller passes a
+        # Price, but assuming the shape turns a wiring mistake into an AttributeError
+        # and an HTTP 500 - and a risk gate that crashes is worse than one that
+        # rejects, because the caller cannot tell a bug from a business refusal.
+        price_value = getattr(price, "value", price) if price is not None else None
         try:
             basic = basic_margin(spec, order.volume.value, price_value, leverage=leverage)
             converted = convert_to_deposit(
@@ -763,16 +912,63 @@ class PreTradeRiskService:
 
         Returns None when no rate is available, which convert_to_deposit turns into a
         rejection. Never returns 1.0 as a guess.
+
+        `market_feed` and `side` are now PASSED. They were omitted, and without a feed
+        `RiskEngine.get_conversion_rate` falls back to its own `market_data_engine` - which
+        is None on the risk engine the container hands this service. Every non-trivial
+        conversion therefore failed, and the caller reported it as "Insufficient free
+        margin", which is a business refusal rather than the wiring fault it was.
+
+        This matters for the normal case, not an exotic one: MT5 computes margin in the
+        symbol's MARGIN currency and converts to the client's deposit currency, and
+        ETHUSD/BTCUSD carry CurrencyMargin = ETH/BTC in the live export. Without this, no
+        crypto symbol could be margined on a USD account.
+
+        `side` follows MT5: "The Ask price is used for buy deals, and the Bid price is
+        used for sell deals." Passing it avoids the function's own BUY default for sells.
         """
         if self.risk_engine is None:
             return None
         getter = getattr(self.risk_engine, "get_conversion_rate", None)
         if getter is None:
             return None
+        feed = self._market_feed_for_conversion()
         try:
-            return getter(from_currency, to_currency)
+            return getter(from_currency, to_currency, feed, side)
+        except TypeError:
+            # A risk engine that does not accept the feed/side arguments: fall back to
+            # the original call rather than failing the order.
+            try:
+                return getter(from_currency, to_currency)
+            except Exception:  # noqa: BLE001
+                return None
         except Exception:  # noqa: BLE001 - an unresolvable rate is a rejection
             return None
+
+    def _market_feed_for_conversion(self) -> Any:
+        """A market-data engine to price a conversion with, or None.
+
+        Prefers anything already held by the service or its risk engine, then the
+        process-wide provider the running API registers. Returns None rather than
+        raising: an absent feed must degrade to "no rate", which the caller already
+        handles as a rejection, not crash the order path.
+        """
+        for holder in (self, getattr(self, "risk_engine", None)):
+            if holder is None:
+                continue
+            for attr in ("market_data_engine", "market_feed", "feed"):
+                candidate = getattr(holder, attr, None)
+                if candidate is not None and hasattr(candidate, "get_latest_tick"):
+                    return candidate
+        try:
+            from api.di_providers import get_market_data_engine
+
+            engine = get_market_data_engine()
+            if engine is not None and hasattr(engine, "get_latest_tick"):
+                return engine
+        except Exception:  # noqa: BLE001 - provider may not be registered (e.g. in tests)
+            pass
+        return None
 
     async def _publish_approval(self, order: Order) -> None:
         """Publishes OrderApprovedEvent.

@@ -71,6 +71,7 @@ from core.domains.accounts.value_objects import (
     RoutingRule,
     SwapConfiguration,
 )
+from core.domains.instruments import symbol_extras
 from core.domains.instruments.enums import (
     CalculationMode,
     ExecutionMode,
@@ -1300,8 +1301,19 @@ def symbol_mt5_record(row: SymbolModel) -> Dict[str, Any]:
 
     if baseline:
         owned = {k: v for k, v in owned.items() if k in _SYMBOL_OWNED_WIRE_KEYS}
+
+    # Fields the symbol editor can change that have NO domain column. They live in
+    # mt5_extra, so the baseline above would otherwise win and an edit would be
+    # shipped back to MT5 as its pre-edit value. Overlaid - not setdefault'd -
+    # precisely because the stored extra is the CURRENT value and the baseline is
+    # the IMPORT-TIME one.
+    stored_extra = _loads(row.mt5_extra, {})
+    for wire in symbol_extras.OWNED_WIRE_KEYS:
+        if wire in stored_extra:
+            owned[wire] = stored_extra[wire]
+
     record.update(owned)
-    for key, value in _loads(row.mt5_extra, {}).items():
+    for key, value in stored_extra.items():
         record.setdefault(key, value)
     return record
 
@@ -1372,6 +1384,14 @@ def db_to_symbol(model: SymbolModel) -> Symbol:
         face_value=_dec(domain.get("face_value"), "0"),
         face_value_currency=model.face_value_currency or "USD",
         is_trade_allowed=bool(model.is_trade_allowed),
+        # The MT5 fields with no domain attribute - tick filtration, the per-day
+        # swap curve, the execution timeouts, currency digits. Carried onto the
+        # entity so the Admin API can return them; before this the serializer's
+        # getattr(symbol, "mt5_extra", {}) always missed and the symbol editor had
+        # nothing to render from.
+        mt5_extra=dict(getattr(model, "mt5_extra", None) or {}),
+        mt5_scale=dict(getattr(model, "mt5_scale", None) or {}),
+        mt5_source=dict(getattr(model, "mt5_source", None) or {}) or None,
         created_at=model.created_at or datetime.now(timezone.utc),
         updated_at=model.updated_at or datetime.now(timezone.utc),
     )

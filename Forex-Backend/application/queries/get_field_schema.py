@@ -37,10 +37,30 @@ def _schemas_dir() -> Path:
 
 def _enum_members(name: str) -> Optional[List[Dict[str, Any]]]:
     """Expand a domain enum name into [{value, name}] - from the CODE, so the
-    schema endpoint can never disagree with what the domain accepts."""
+    schema endpoint can never disagree with what the domain accepts.
+
+    Searched across BOTH enum modules, because the objects we serve schemas for
+    draw on different domains: groups/accounts/clients/managers live in
+    ``accounts.enums``, while every symbol-editor switch (tick flags, swap flags,
+    margin flags, the margin-rate row order) lives in ``instruments.enums``.
+
+    Order matters. ``accounts`` is consulted first so the group and account
+    schemas keep resolving exactly what they resolved before this change; a name
+    present in both modules would otherwise silently switch member lists. That is
+    not hypothetical - MT5 calls two unrelated bitmasks *TradeFlags*, so the
+    symbol-side enums in ``instruments.enums`` are deliberately named
+    ``SymbolTradeFlags`` to keep the two from colliding here.
+
+    Returns None when NEITHER module defines the name, which is the honest
+    answer: the caller then leaves ``enum_values`` off the descriptor rather than
+    inventing an empty member list the UI would render as a blank dropdown.
+    """
     from core.domains.accounts import enums as account_enums
+    from core.domains.instruments import enums as instrument_enums
 
     enum_cls = getattr(account_enums, name, None)
+    if enum_cls is None:
+        enum_cls = getattr(instrument_enums, name, None)
     if enum_cls is None:
         return None
     out = []
