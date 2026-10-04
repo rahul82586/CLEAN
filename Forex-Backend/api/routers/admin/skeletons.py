@@ -1045,7 +1045,17 @@ async def update_symbol(
             if open_pos:
                 logins = {int(p.account_login) for p in open_pos}
                 for l in logins:
-                    await recalculate_account_trading_state(l, acc_repo, pos_repo, symbol_repo)
+                    # R17: pass the registered risk engine, as the manager path does.
+                    # Without it the fallback ran with `rate_lookup -> Decimal("1")` and
+                    # summed profit in the QUOTE currency, so editing ONE symbol rewrote the
+                    # risk state of every account holding it at 1:1 - materially wrong for
+                    # the 22 live symbols whose CurrencyMargin differs from CurrencyBase.
+                    from api.di_providers import get_risk_engine
+
+                    await recalculate_account_trading_state(
+                        l, acc_repo, pos_repo, symbol_repo,
+                        risk_engine=get_risk_engine(),
+                    )
     except Exception as exc:
         logger.warning(f"update_symbol account recalculation notice: {exc}")
 

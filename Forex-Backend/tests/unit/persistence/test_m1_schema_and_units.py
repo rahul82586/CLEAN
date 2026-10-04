@@ -209,8 +209,13 @@ def _account(equity: str, margin: str, call: str = "80", stop: str = "50") -> Ac
 
 def test_margin_profile_defaults_are_percent():
     profile = MarginProfile()
-    assert profile.margin_call_level == Decimal("80")
-    assert profile.stop_out_level == Decimal("50")
+    # R11: these are MT5's own numbers from the live export (MarginCall 50.00 /
+    # MarginStopOut 30.00), which the loader and the persistence mapper already used. The
+    # dataclass previously defaulted to 80/50, so an account whose group failed to load was
+    # stopped out 20 percentage points later than configured. The assertion below is the
+    # test's real intent and is unchanged: a value <= 1 would be a fraction, not a percent.
+    assert profile.margin_call_level == Decimal("50")
+    assert profile.stop_out_level == Decimal("30")
     assert profile.margin_call_level > Decimal("1"), (
         "a threshold <= 1 is a fraction, and fractions are the bug this test guards"
     )

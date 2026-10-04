@@ -72,6 +72,11 @@ from core.domains.accounts.value_objects import (
     SwapConfiguration,
 )
 from core.domains.instruments import symbol_extras
+
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
 from core.domains.instruments.enums import (
     CalculationMode,
     ExecutionMode,
@@ -867,8 +872,12 @@ def db_to_group(model: GroupModel) -> Group:
                 mt5enums.MARGIN_MODE_FROM_MT5.get(_int(model.margin_mode, 0)),
                 MarginMode.RETAIL,
             ),
-            margin_call_level=_dec(margin_dom.get("margin_call_level"), "50"),
-            stop_out_level=_dec(margin_dom.get("stop_out_level"), "30"),
+            margin_call_level=_dec(
+                  margin_dom.get("margin_call_level"), str(DEFAULT_MARGIN_CALL_LEVEL)
+              ),
+            stop_out_level=_dec(
+                  margin_dom.get("stop_out_level"), str(DEFAULT_STOP_OUT_LEVEL)
+              ),
             stop_out_mode=_enum(
                 StopOutMode,
                 mt5enums.STOP_OUT_MODE_FROM_MT5.get(_int(model.margin_so_mode, 0)),

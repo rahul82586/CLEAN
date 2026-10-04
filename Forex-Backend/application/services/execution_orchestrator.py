@@ -403,7 +403,10 @@ class ExecutionOrchestrator:
         try:
             await self.event_bus.publish(DomainEvent(
                 event_type=EventType.DEAL_CREATED,
-                aggregate_id=order.ticket_id,
+                aggregate_id=deal.deal_id,  # R29: the DEAL is the aggregate, matching record_deal's DealCreated
+                # R29: `aggregate_id` above is the DEAL, matching `record_deal`'s
+                # DealCreated on this same channel. It used to be the ORDER id, so a
+                # consumer keying on aggregate_id saw two identities for one deal.
                 payload={
                     "order_id": order.ticket_id,
                     "deal_id": deal.deal_id,
@@ -752,6 +755,9 @@ class ExecutionOrchestrator:
             await self.event_bus.publish(DomainEvent(
                 event_type=EventType.ORDER_ROUTED,
                 aggregate_id=order.ticket_id,
+                # R29: `aggregate_id` above is the DEAL, matching `record_deal`'s
+                # DealCreated on this same channel. It used to be the ORDER id, so a
+                # consumer keying on aggregate_id saw two identities for one deal.
                 payload={
                     "order_id": order.ticket_id,
                     "destination": ExecutionDestination.B_BOOK.value,
@@ -831,7 +837,10 @@ class ExecutionOrchestrator:
             # event carries the routing context a downstream hedger needs.
             await self.event_bus.publish(DomainEvent(
                 event_type=EventType.DEAL_CREATED,
-                aggregate_id=order.ticket_id,
+                aggregate_id=deal.deal_id,  # R29: the DEAL is the aggregate, matching record_deal's DealCreated
+                # R29: `aggregate_id` above is the DEAL, matching `record_deal`'s
+                # DealCreated on this same channel. It used to be the ORDER id, so a
+                # consumer keying on aggregate_id saw two identities for one deal.
                 payload={
                     "order_id": order.ticket_id,
                     "deal_id": deal.deal_id,
@@ -943,6 +952,9 @@ class ExecutionOrchestrator:
             event = DomainEvent(
                 event_type=EventType.ORDER_ROUTED,
                 aggregate_id=order.ticket_id,
+                # R29: `aggregate_id` above is the DEAL, matching `record_deal`'s
+                # DealCreated on this same channel. It used to be the ORDER id, so a
+                # consumer keying on aggregate_id saw two identities for one deal.
                 payload={
                     "order_id": order.ticket_id,
                     "destination": ExecutionDestination.IN_HOUSE_ECN.value,
@@ -994,7 +1006,7 @@ class ExecutionOrchestrator:
 
         event = DomainEvent(
             event_type=EventType.ORDER_REJECTED,
-            aggregate_id=order.ticket_id,
+                aggregate_id=order.ticket_id,
             payload={
                 "order_id": order.ticket_id,
                 "reason": reason

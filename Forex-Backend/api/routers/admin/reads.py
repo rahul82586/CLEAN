@@ -840,6 +840,15 @@ async def get_risk_summary(
             for a in accounts:
                 eq = a.equity.amount if hasattr(a.equity, "amount") else Decimal(str(a.equity))
                 total_equity += eq
+                # R18: sum the STORED `margin_used`, the column every other path
+                # maintains. The previous figure was `position.volume * 100` - no price,
+                # no contract size, no leverage, no calc mode - so both the firm-wide
+                # margin and the average margin level below were fiction, and `at_risk`
+                # counted accounts on that invented level.
+                try:
+                    total_margin += Decimal(str(getattr(a.margin_used, 'amount', 0) or 0))
+                except Exception:  # noqa: BLE001
+                    pass
                 lvl = float(getattr(a, 'margin_level', 0) or 0)
                 if 0 < lvl < 300:
                     at_risk += 1
@@ -854,7 +863,7 @@ async def get_risk_summary(
                 prof = p.profit.amount if hasattr(p.profit, "amount") else Decimal(str(p.profit))
                 total_profit += prof
                 vol = p.volume.value if hasattr(p.volume, "value") else Decimal(str(p.volume))
-                total_margin += vol * Decimal("100")
+                # R18: no `vol * 100`. See the real margin_used sum above.
         except Exception:
             pass
 

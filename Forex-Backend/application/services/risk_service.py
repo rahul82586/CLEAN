@@ -33,13 +33,22 @@ class PreTradeRiskService:
         position_repo: Optional[IPositionRepository] = None,
         risk_engine: Optional[Any] = None,
         symbol_repo: Optional[Any] = None,
-        account_repo: Optional[Any] = None
+        account_repo: Optional[Any] = None,
+        holiday_repo: Optional[Any] = None,
+        order_repo: Optional[Any] = None,
     ):
         self.event_bus = event_bus
         self.position_repo = position_repo
         self.risk_engine = risk_engine
         self.symbol_repo = symbol_repo
         self.account_repo = account_repo
+        #: The HOLIDAY repository - a different repository from `symbol_repo`.
+        #: `_check_holiday` used to probe `symbol_repo`, whose `get_all()` returns
+        #: SYMBOLS, so the holiday gate never once ran on the order path.
+        self.holiday_repo = holiday_repo
+        #: Order repository, for MT5's group LimitOrders - which counts working
+        #: ORDERS. The old code counted POSITIONS for it.
+        self.order_repo = order_repo
         self._account_locks: Dict[str, asyncio.Lock] = {}
         #: reason for the most recent rejection. validate_order() returns a bool, so a
         #: caller that suppresses event publishing (CreateOrderHandler does, to keep the
@@ -191,7 +200,7 @@ class PreTradeRiskService:
                 return False
 
             # 5. Volume Limits Check
-            if not self._check_volume_limits(order.volume, symbol):
+            if not self._check_volume_limits(order.volume, symbol, live_account):
                 reason = f"Volume {order.volume.value} exceeds limits for {symbol.name} (Min: {symbol.volume_min}, Max: {symbol.volume_max})"
                 logger.warning(f"Order {order.ticket_id} rejected: {reason}")
                 self.last_rejection_reason = reason
@@ -223,7 +232,7 @@ class PreTradeRiskService:
             # MT_RET_REQUEST_LIMIT_ORDERS (10033), _LIMIT_POSITIONS (10040),
             # _LIMIT_VOLUME (10034). The three fields existed on Group and none of
             # them was ever consulted at order entry.
-            if not await self._check_order_and_position_limits(live_account, symbol):
+            if not await self._check_order_and_position_limits(live_account, symbol, order):
                 reason = self.last_rejection_reason
                 logger.warning(f"Order {order.ticket_id} rejected: {reason}")
                 if publish_events:
@@ -443,14 +452,32 @@ class PreTradeRiskService:
         stop the whole book from trading. It does log, because a silently ignored
         holiday is the bug this method exists to fix.
         """
-        repo = self.symbol_repo
+        # The HOLIDAY repository, not `symbol_repo`. `symbol_repo.get_all()` returns
+        # Symbols, and the entity checks below read `.month`/`.day`, which a Symbol does not
+        # have - so the old fallback could only ever conclude "not a holiday" and the gate
+        # was dead. If no holiday repository is wired the honest answer is "cannot tell",
+        # which the caller treats as allowed and this method logs.
+        repo = self.holiday_repo
         if repo is None:
+            logger.warning(
+                "no holiday repository is wired; the holiday trading gate cannot run"
+            )
             return None
 
+        # The VERIFIED signatures, so the right one is tried first:
+        #   get_active_holidays(check_date: datetime)          <- what this needs
+        #   get_holidays_for_symbol(symbol_name: str, year)    <- needs a year too
+        #
+        # The first version called `get_holidays_for_symbol(symbol_name)` with one argument,
+        # raised a TypeError, and `return None`-ed WITHOUT trying the others - so wiring the
+        # repository produced a logged error and still no enforcement. An exception in one
+        # probe now continues to the next: "this repository cannot answer in that shape" is
+        # not the same as "there is no holiday".
+        year = getattr(now, "year", None) or datetime.now(_tz.utc).year
         holidays = None
         for name, args in (
-            ("get_holidays_for_symbol", (symbol_name,)),
             ("get_active_holidays", (now,)),
+            ("get_holidays_for_symbol", (symbol_name, year)),
             ("get_all", ()),
         ):
             getter = getattr(repo, name, None)
@@ -458,6 +485,12 @@ class PreTradeRiskService:
                 continue
             try:
                 holidays = await getter(*args)
+            except TypeError as exc:
+                logger.warning(
+                    "Holiday lookup (%s) could not be called for %s: %s; trying the next",
+                    name, symbol_name, exc,
+                )
+                continue
             except Exception as exc:  # noqa: BLE001 - never fail-closed on an outage
                 logger.warning("Holiday lookup (%s) for %s failed: %s", name, symbol_name, exc)
                 return None
@@ -594,7 +627,9 @@ class PreTradeRiskService:
             return False
         return True
 
-    async def _check_order_and_position_limits(self, account: Account, symbol: Symbol) -> bool:
+    async def _check_order_and_position_limits(
+        self, account: Account, symbol: Symbol, order: Order
+    ) -> bool:
         """MT5 group limits: LimitOrders (10033), LimitPositions (10040), volume (10034).
 
         A limit of 0 means unlimited in MT5 and is skipped. Every gate is skipped
@@ -616,21 +651,19 @@ class PreTradeRiskService:
             limit_orders = int(getattr(group, "limit_orders", 0) or 0)
         except (TypeError, ValueError):
             limit_orders = 0
-        if limit_orders > 0 and self.position_repo is not None and login_key is not None:
-            finder = getattr(self.position_repo, "get_by_account", None)
-            if callable(finder):
-                try:
-                    open_positions = await finder(login_key) or []
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("Order-limit read failed for %s: %s", login_key, exc)
-                    open_positions = None
-                if open_positions is not None and len(open_positions) >= limit_orders:
-                    self.last_rejection_reason = (
-                        f"Reached the limit on the number of orders for this account "
-                        f"({len(open_positions)}/{limit_orders})"
-                    )
-                    self.last_rejection_code = Retcode.LIMIT_ORDERS
-                    return False
+        # MT5 LimitOrders counts ORDERS; LimitPositions counts POSITIONS. This block
+        # used the POSITION finder for both, so an account with 200 open positions
+        # and no pending orders was refused for "too many orders", while 200 pending
+        # orders and no positions was allowed.
+        if limit_orders > 0 and login_key is not None:
+            count_orders = await self._count_live_orders(login_key)
+            if count_orders is not None and count_orders >= limit_orders:
+                self.last_rejection_reason = (
+                    f"Reached the limit on the number of orders for this account "
+                    f"({count_orders}/{limit_orders})"
+                )
+                self.last_rejection_code = Retcode.LIMIT_ORDERS
+                return False
 
         # Open-position count - MT_RET_REQUEST_LIMIT_POSITIONS (10040).
         try:
@@ -695,12 +728,22 @@ class PreTradeRiskService:
                             total += Decimal(str(getattr(vol, "value", vol)))
                         except Exception:  # noqa: BLE001
                             continue
-                    incoming = Decimal("0")
+                    # `order` is now a real parameter. It used to be an undefined name
+                    # whose NameError this except swallowed, so `incoming` silently
+                    # became 0 and the gate measured the EXISTING book against the
+                    # cap - allowing unlimited additional volume to a client already
+                    # at the limit.
+                    incoming = None
                     try:
                         vol = getattr(order, "volume", None)
                         incoming = Decimal(str(getattr(vol, "value", vol)))
-                    except Exception:  # noqa: BLE001
-                        incoming = Decimal("0")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "Volume-limit gate could not read the incoming volume for %s: %s", login_key, exc)
+                    if incoming is None:
+                        # Cannot count -> do not invent a zero. The docstring already
+                        # promises this; now the code keeps it.
+                        return True
                     if total + incoming > limit_volume:
                         self.last_rejection_reason = (
                             f"Reached the volume limit for this account "
@@ -709,6 +752,32 @@ class PreTradeRiskService:
                         self.last_rejection_code = Retcode.LIMIT_VOLUME
                         return False
         return True
+
+    async def _count_live_orders(self, login: int) -> Optional[int]:
+        """Count live PENDING ORDERS for a login, or None when it cannot be counted.
+
+        MT5's group LimitOrders counts working ORDERS, not positions. The previous
+        implementation counted positions for both group limits, so an account with no
+        pending orders and 200 open positions was refused for "too many orders", while an
+        account resting 200 pending orders and holding no positions was allowed.
+
+        Falls back to the position count only when the order repository is absent, so a
+        repository that CAN answer and reports zero is never second-guessed.
+        """
+        repo = getattr(self, "order_repo", None)
+        finder = getattr(repo, "find_pending_orders", None)
+        if callable(finder):
+            try:
+                pending = await finder(login) or []
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Pending-order count failed for %s: %s", login, exc)
+                return None
+            return sum(1 for o in pending if not getattr(o, "time_done", None))
+
+        # No order repository wired: report the position count, which is what the old code
+        # used for BOTH limits, so behaviour is unchanged for such a setup.
+        return await self._count_open_positions(login)
+
 
     async def _count_open_positions(self, login: int) -> Optional[int]:
         """Count open positions for a login, or None when it cannot be counted."""
@@ -728,18 +797,76 @@ class PreTradeRiskService:
             return True
         return group.is_symbol_allowed(symbol_name)
 
-    def _check_volume_limits(self, volume: Volume, symbol: Symbol) -> bool:
-        """Validates volume against the symbol's min / max / step.
+    def _check_volume_limits(
+        self, volume: Volume, symbol: Symbol, account: Optional[Account] = None
+    ) -> bool:
+        """Volume against the SYMBOL limits AND the GROUP per-symbol overrides.
 
-        Delegates to Symbol.validate_volume, which is the same rule
-        CreateOrderHandler already applied a few lines earlier. This was a second
-        implementation of it, and the two disagreed: this one compared against
-        volume_min / volume_max unconditionally, so a symbol whose limits came back as 0
-        from the database rejected every order, and it called is_valid_step(0) which
-        raised decimal.InvalidOperation rather than returning a verdict.
+        R2: this read only `symbol.validate_volume(...)`, so a group restricting volume per
+        symbol - MT5's normal way to cap one instrument for one client segment - had NO
+        effect. A group override of `volume_max = 1.0` on EURUSD did not stop a 5-lot order.
+
+        The TIGHTER bound wins, which is the safe direction: a group may restrict below the
+        symbol, never widen above it.
+
+        The symbol half delegates to `Symbol.validate_volume` deliberately - it is the rule
+        `CreateOrderHandler` applies, and a second copy of it previously drifted.
         """
-        ok, _reason = symbol.validate_volume(volume.value)
-        return ok
+        ok, reason = symbol.validate_volume(volume.value)
+        if not ok:
+            self.last_rejection_reason = reason
+            self.last_rejection_code = Retcode.INVALID_VOLUME
+            return False
+
+        group = getattr(account, "group", None) if account is not None else None
+        if group is None:
+            return True
+        getter = getattr(group, "get_symbol_config", None)
+        if not callable(getter):
+            return True
+        try:
+            overrides = getter(symbol.name) or {}
+        except Exception as exc:  # noqa: BLE001
+            # A group that cannot be read is NOT permission to skip its caps.
+            logger.error(
+                "could not read the group symbol config for %s: %s; refused rather than "
+                "checked against no group cap at all",
+                symbol.name, exc,
+            )
+            self.last_rejection_reason = (
+                "the group per-symbol limits could not be read"
+            )
+            self.last_rejection_code = Retcode.REQUEST_REJECT
+            return False
+
+        try:
+            group_min = overrides.get("volume_min")
+            group_max = overrides.get("volume_max")
+            if group_min is not None and Decimal(str(group_min)) > 0:
+                if volume.value < Decimal(str(group_min)):
+                    self.last_rejection_reason = (
+                        f"Volume {volume.value} below the group minimum "
+                        f"{group_min} for {symbol.name}"
+                    )
+                    self.last_rejection_code = Retcode.INVALID_VOLUME
+                    return False
+            if group_max is not None and Decimal(str(group_max)) > 0:
+                if volume.value > Decimal(str(group_max)):
+                    self.last_rejection_reason = (
+                        f"Volume {volume.value} above the group maximum "
+                        f"{group_max} for {symbol.name}"
+                    )
+                    self.last_rejection_code = Retcode.INVALID_VOLUME
+                    return False
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            logger.error("unreadable group volume bounds for %s: %s", symbol.name, exc)
+            self.last_rejection_reason = (
+                "the group per-symbol volume limits are malformed"
+            )
+            self.last_rejection_code = Retcode.REQUEST_REJECT
+            return False
+
+        return True
 
     async def _check_margin_requirement(
         self,
@@ -856,30 +983,37 @@ class PreTradeRiskService:
         return required
 
     def _resolve_leverage(self, account: Account, symbol: Symbol) -> int:
-        """Account override, then group, then the symbol cap. Never zero.
+        """Delegate to the account's own resolver. There is ONE of these, on purpose.
 
-        MT5 applies the most restrictive of these. The previous code used
-        min(group.leverage_default, group.leverage_max), which ignored the account's own
-        override entirely.
+        This used to be a second implementation, and it disagreed with the booking path by
+        10x: it applied the group's ``leverage_max`` while ``Account.effective_leverage()``
+        ignored it. The gate charged 100 where every booked figure used 1000 on the same
+        account, so ``margin_used`` was understated and stop-out fired late or never.
+
+        It is now a DELEGATION, which is the point: the value of the fix is that the gate
+        and the book cannot drift, not which of the two numbers won.
         """
-        candidates = []
+        resolver = getattr(account, "effective_leverage", None)
+        if callable(resolver):
+            try:
+                return int(resolver(symbol))
+            except TypeError:
+                # An account object whose effective_leverage takes no argument.
+                return int(resolver())
+
+        # No resolver at all: derive from the group rather than inventing a number.
+        # Returning 1 here would charge full notional margin, which is the safe direction
+        # but a surprising figure to produce silently.
+        fallback = []
         account_leverage = getattr(account, "leverage", None)
         if account_leverage and account_leverage > 0:
-            candidates.append(int(account_leverage))
-        group = getattr(account, "group", None)
-        if group is not None:
-            default = getattr(group.margin, "leverage_default", 0) or 0
-            maximum = getattr(group.margin, "leverage_max", 0) or 0
-            if default > 0:
-                candidates.append(int(default))
-            if maximum > 0:
-                candidates.append(int(maximum))
-        symbol_max = getattr(symbol, "leverage_max", 0) or 0
-        if symbol_max > 0:
-            candidates.append(int(symbol_max))
-        if not candidates:
-            return 1
-        return min(candidates)
+            fallback.append(int(account_leverage))
+        margin = getattr(getattr(account, "group", None), "margin", None)
+        for name in ("leverage_default", "leverage_max"):
+            value = getattr(margin, name, 0) or 0
+            if value > 0:
+                fallback.append(int(value))
+        return min(fallback) if fallback else 100
 
     def _apply_group_overrides(self, spec, overrides: dict):
         """Overlay a group's per-symbol overrides onto the symbol spec.
@@ -901,10 +1035,14 @@ class PreTradeRiskService:
                 rates[key.replace("margin_rate_initial_", "initial_")] = _Decimal(str(value))
             elif key.startswith("margin_rate_maintenance_"):
                 rates[key.replace("margin_rate_maintenance_", "maintenance_")] = _Decimal(str(value))
-            elif key == "contract_size":
-                changes["contract_size"] = _Decimal(str(value))
-            elif key == "margin_hedged":
-                changes["margin_hedged"] = _Decimal(str(value))
+            # R8: `contract_size` and `margin_hedged` used to be handled here and could
+            # NEVER fire - `GroupSymbolOverride` has no such fields, so both branches were
+            # dead code that read like coverage. Removed.
+            #
+            # STATED LIMIT: only the two INITIAL market rates (`margin_rate_initial_buy` /
+            # `_sell`) and the maintenance rates are overridable per group. MT5 exposes 16
+            # rate slots; the six pending types have no override field on the entity at all.
+            # That is a modelling gap, recorded here rather than implied by a missing elif.
         return _replace(spec, rates=rates, **changes)
 
     def _rate_lookup(self, from_currency: str, to_currency: str, side: str):
@@ -933,16 +1071,39 @@ class PreTradeRiskService:
         if getter is None:
             return None
         feed = self._market_feed_for_conversion()
+        # R21: inspect the SIGNATURE rather than catching TypeError.
+        #
+        # The previous form called `getter(from, to, feed, side)` and, on ANY TypeError,
+        # retried `getter(from, to)`. A TypeError raised INSIDE the lookup is
+        # indistinguishable from "this engine takes 2 arguments", so a genuine rate
+        # failure silently retried WITHOUT `side` - converting at the wrong side of the
+        # spread. The signature says which call is correct; an exception cannot.
         try:
-            return getter(from_currency, to_currency, feed, side)
-        except TypeError:
-            # A risk engine that does not accept the feed/side arguments: fall back to
-            # the original call rather than failing the order.
-            try:
-                return getter(from_currency, to_currency)
-            except Exception:  # noqa: BLE001
-                return None
-        except Exception:  # noqa: BLE001 - an unresolvable rate is a rejection
+            import inspect as _inspect
+
+            _params = _inspect.signature(getter).parameters
+            _takes_four = len(_params) >= 4 or any(
+                prm.kind == _inspect.Parameter.VAR_POSITIONAL for prm in _params.values()
+            )
+        except (TypeError, ValueError):
+            # Un-introspectable (a C function, a partial): the 4-arg call is what the
+            # engine this service is built with takes.
+            _takes_four = True
+
+        try:
+            if _takes_four:
+                return getter(from_currency, to_currency, feed, side)
+            return getter(from_currency, to_currency)
+        except TypeError as exc:
+            # Reached only for a genuinely mis-signatured engine, and REPORTED - never a
+            # silent retry that drops `side`.
+            logger.error(
+                "risk engine get_conversion_rate(%s -> %s) rejected the call: %s",
+                from_currency, to_currency, exc,
+            )
+            return None
+        except Exception:  # noqa: BLE001 - an unresolvable rate is a refusal, not a crash
+            return None
             return None
 
     def _market_feed_for_conversion(self) -> Any:

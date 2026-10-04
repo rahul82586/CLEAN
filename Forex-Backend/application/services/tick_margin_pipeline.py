@@ -6,9 +6,10 @@ Tick -> Position PnL Update -> Account Equity Recalculation -> Margin State Eval
 
 Mirrors MT5's IMTTickSink -> IMTAccountSink flow.
 """
+import asyncio
 import logging
 from decimal import Decimal
-from typing import Dict, List, Set
+from typing import Any, Dict, List, Set
 from datetime import datetime, timezone
 
 from core.domains.market_data.models import Tick
@@ -44,7 +45,8 @@ class TickMarginPipeline:
         account_repo: IAccountRepository,
         symbol_repo: ISymbolRepository,
         risk_engine: RiskEngine,
-        event_bus: IEventBus
+        event_bus: IEventBus,
+        coalesce_seconds: float = 0.0,
     ):
         self.position_repo = position_repo
         self.account_repo = account_repo
@@ -52,12 +54,79 @@ class TickMarginPipeline:
         self.risk_engine = risk_engine
         self.event_bus = event_bus
         #: D15 - whether the full-row fallback warning has already been logged
+        # R22: trailing-edge coalescing window, in seconds. 0 DISABLES it, which is the
+        # default so every existing caller and test keeps today's behaviour exactly.
+        #
+        # The pipeline ran for EVERY tick, doing per-account and per-position reads and
+        # writes, while its own docstring says it should not touch the database on every
+        # tick. A symbol printing dozens of quotes a second drove dozens of full
+        # recomputations, of which only the last mattered - margin state depends on the
+        # CURRENT price, not on the path taken to it.
+        self.coalesce_seconds = max(0.0, float(coalesce_seconds))
+        self._pending: Dict[str, Any] = {}
+        self._flush_tasks: Dict[str, Any] = {}
         self._warned_full_row_save = False
 
     async def process_tick(self, tick: Tick) -> None:
+        """Entry point for a new Tick. Coalesces when a window is configured.
+
+        R22: with `coalesce_seconds > 0` the FIRST tick for a symbol schedules a flush and
+        every later tick in that window only REPLACES the stored price. Two properties are
+        preserved deliberately:
+
+        * the newest price is always the one applied - margin state depends on the current
+          price, not on the path taken to it;
+        * a symbol that ticks once still updates, because the flush is scheduled by the
+          first tick of the window rather than waiting for a second one.
+
+        With `coalesce_seconds == 0` (the default) this is the original synchronous
+        per-tick behaviour, so nothing existing changes.
         """
-        Main entry point. Called when a new Tick arrives.
+        if self.coalesce_seconds <= 0:
+            await self._process_tick_now(tick)
+            return
+
+        symbol_name = tick.symbol
+        self._pending[symbol_name] = tick
+        task = self._flush_tasks.get(symbol_name)
+        if task is None or task.done():
+            self._flush_tasks[symbol_name] = asyncio.create_task(
+                self._flush_later(symbol_name)
+            )
+
+    async def _flush_later(self, symbol_name: str) -> None:
+        """Apply the newest tick for a symbol once the coalescing window closes."""
+        try:
+            await asyncio.sleep(self.coalesce_seconds)
+            tick = self._pending.pop(symbol_name, None)
+            if tick is not None:
+                await self._process_tick_now(tick)
+        except asyncio.CancelledError:  # pragma: no cover - shutdown path
+            raise
+        except Exception:  # noqa: BLE001 - one symbol must not kill the loop
+            logger.exception("coalesced margin flush failed for %s", symbol_name)
+
+    async def flush_all(self) -> int:
+        """Apply every pending tick now, and return how many were applied.
+
+        Public so a shutdown or a test can drain deterministically instead of sleeping for
+        the window.
         """
+        applied = 0
+        for symbol_name, tick in list(self._pending.items()):
+            self._pending.pop(symbol_name, None)
+            task = self._flush_tasks.pop(symbol_name, None)
+            if task is not None and not task.done():
+                task.cancel()
+            try:
+                await self._process_tick_now(tick)
+                applied += 1
+            except Exception:  # noqa: BLE001
+                logger.exception("could not flush %s", symbol_name)
+        return applied
+
+    async def _process_tick_now(self, tick: Tick) -> None:
+        """The original per-tick body, renamed so the coalescer can wrap it."""
         symbol_name = tick.symbol
         
         # 1. Fetch all open positions for this symbol
@@ -258,4 +327,4 @@ class TickMarginPipeline:
             logger.warning(
                 f"Margin State Change: {event_type} for Account {account.login} | "
                 f"Level: {evt_dict.get('margin_level')}"
-            )
+            )

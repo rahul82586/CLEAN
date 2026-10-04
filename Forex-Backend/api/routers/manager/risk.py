@@ -11,7 +11,11 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from typing import Optional
 
 from api.auth.admin_dependencies import get_current_manager
-from api.di_providers import get_account_repo, get_risk_engine
+from api.di_providers import (
+    get_account_repo,
+    get_risk_engine,
+    get_symbol_repo,
+)
 from api.schemas.manager.risk import (
     MarginCheckRequest,
     MarginCheckResponse,
@@ -53,18 +57,89 @@ async def margin_check(
             detail=f"Account {request.login} not found",
         )
 
-    # Simple margin calculation check
-    margin_req = Decimal("100.0") * request.volume
-    margin_free = target_account.balance.amount - margin_req
-    sufficient = margin_free > Decimal("0")
-    
+    # The REAL engine, not a made-up number.
+    #
+    # This used to be `Decimal("100.0") * request.volume` with a LITERAL post-trade margin
+    # level of 500.0 or 40.0. No price, no contract size, no calc mode, no margin rate, no
+    # currency conversion, no group leverage, and no sight of the account's existing
+    # positions. A dealer sizing a ticket from this endpoint got fiction.
+    #
+    # It now runs the same four-stage calculation the pre-trade gate and the fill path use,
+    # so the figure agrees with what the order will actually require.
+    from core.domains.market_data.margin import (
+        Leg,
+        SymbolMarginSpec,
+        calculate_account_margin,
+        margin_level as _margin_level,
+    )
+
+    symbol_name = str(request.symbol or "")
+    symbol = None
+    symbol_repo = get_symbol_repo()
+    if symbol_repo is not None:
+        try:
+            symbol = await symbol_repo.find_by_name(symbol_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("MarginCheck could not load %s: %s", symbol_name, exc)
+            symbol = None
+    if symbol is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Trade rejected: unknown symbol {symbol_name}",
+        )
+
+    is_buy = str(getattr(request, "operation", "") or "BUY").upper().startswith("B")
+    operation = "BUY" if is_buy else "SELL"
+    volume = Decimal(str(request.volume))
+    spec = SymbolMarginSpec.from_symbol(symbol)
+
+    try:
+        # The engine's own price access, so the side (ask for a buy, bid for a sell) and the
+        # symbol's margin currency are handled exactly as they are on the order path.
+        price = risk_engine._side_price(symbol.name, "ask" if is_buy else "bid")
+        breakdown = calculate_account_margin(
+            [
+                Leg(
+                    symbol=symbol.name,
+                    operation=operation,
+                    volume=volume,
+                    price=price,
+                    is_pending=False,
+                    spec=spec,
+                )
+            ],
+            specs={symbol.name: spec},
+            deposit_currency=target_account.currency,
+            rate_lookup=risk_engine._rate_lookup,
+            leverage=target_account.effective_leverage(),
+            # "When opening positions, the initial margin is checked."
+            maintenance=False,
+        )
+        margin_req = breakdown.total
+    except Exception as exc:  # noqa: BLE001
+        # The canonical calculator REFUSES rather than guessing when it cannot price the
+        # symbol or convert the currency. A desk must be told that, not handed a number.
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=f"Cannot compute margin for {symbol_name}: {exc}",
+        )
+
+    free_after = target_account.margin_free.amount - margin_req
+    used_after = target_account.margin_used.amount + margin_req
+    level_after = _margin_level(target_account.equity.amount, used_after)
+    sufficient = free_after >= Decimal("0")
+
     return MarginCheckResponse(
         retcode=0,
         margin_required=margin_req,
-        margin_free=margin_free,
-        margin_level_after=Decimal("500.0") if sufficient else Decimal("40.0"),
+        margin_free=free_after,
+        margin_level_after=level_after,
         is_sufficient=sufficient,
-        message="Margin check completed",
+        message=(
+            "Margin check completed"
+            if sufficient
+            else "Insufficient free margin for the proposed trade"
+        ),
     )
 
 

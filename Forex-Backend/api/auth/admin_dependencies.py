@@ -66,11 +66,89 @@ async def get_current_manager(
             margin_level=Decimal("999999"),
             is_enabled=True,
         )
-    # Fallback to standard Bearer token
+    # Bearer token: resolve a MANAGER, never a client account.
+    #
+    # This used to delegate to the CLIENT-plane resolver:
+    #     return await get_current_user(token=token, account_repo=account_repo, ...)
+    # so a token carrying `is_manager: True` was resolved into a CLIENT Account, and only
+    # ever "worked" because `get_current_user` fabricated one (R7). A manager token must
+    # never be resolved as a client identity at all.
+    #
+    # The resolution below mirrors `require_right` in this same file, which already does it
+    # correctly. It differs deliberately in that it checks no specific right, because it
+    # serves routes that are not right-gated.
     if authorization and authorization.lower().startswith("bearer "):
         token = authorization.split(" ", 1)[1].strip()
-        from api.auth.dependencies import get_token_blacklist
-        return await get_current_user(token=token, account_repo=account_repo, token_blacklist=None)
+        try:
+            from api.auth.jwt_handler import verify_token
+            payload = verify_token(token)
+        except Exception:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if not payload.get("is_manager"):
+            # A client token on the manager plane is REFUSED, not silently turned into
+            # whatever identity happens to be loadable.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="client tokens cannot access the manager plane",
+            )
+
+        subject = payload.get("sub")
+        if subject is None or str(subject).strip() == "":
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        from api.di_providers import get_manager_repo
+
+        repo = get_manager_repo()
+        if repo is None:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail=(
+                    "the manager repository is not registered in the DI container; "
+                    "manager identity cannot be verified on this server"
+                ),
+            )
+
+        manager = await repo.find_by_login(str(subject).strip())
+        # Unknown or inactive is ONE answer: no login enumeration, never a fabricated
+        # identity.
+        if manager is None or not getattr(manager, "is_active", False):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Could not validate credentials",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+
+        if getattr(manager, "must_change_password", False):
+            # MT_RET_AUTH_RESET_PASSWORD (1026). Stored since M2, enforced here as it is
+            # in require_right.
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "password change required before this action "
+                    "(MT_RET_AUTH_RESET_PASSWORD)"
+                ),
+            )
+
+        client_ip = request.client.host if request.client else None
+        if not _ip_allowed(client_ip, list(getattr(manager, "allowed_ips", None) or [])):
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=(
+                    "IP address is not valid for this manager "
+                    "(MT_RET_AUTH_MANAGER_IPBLOCK)"
+                ),
+            )
+
+        return manager
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Missing or invalid authentication credentials (pass X-Admin-API-Key or Bearer token)",

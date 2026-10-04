@@ -74,18 +74,47 @@ class MockDealRepository:
 
 
 class MockSymbolRepository:
+    """Carries BOTH lookups, like the production wiring.
+
+    `build_trading_stack` resolves a SYNCHRONOUS ConfigCache-backed view
+    (`_resolve_sync_symbol_view`) and hands THAT to RiskEngine, because
+    `RiskEngine._symbol()` deliberately refuses an async repository on the hot path
+    ("this is what ConfigCache is for").
+
+    This mock only had the async `find_by_name`, so the post-liquidation recompute raised,
+    and the test only passed because R13's fallback then fabricated `margin_used = 0` and
+    `margin_level = 999999`, which read as a recovery. R13 removes that fabrication, so the
+    mock now models what production actually passes.
+    """
+
     def __init__(self, symbols: List[Symbol] = None):
         self.symbols: Dict[str, Symbol] = {s.name: s for s in (symbols or [])}
-    
+
+    #: the SYNCHRONOUS lookup RiskEngine uses
+    def get_symbol(self, name: str) -> Optional[Symbol]:
+        return self.symbols.get(name)
+
     async def find_by_name(self, name: str) -> Optional[Symbol]:
         return self.symbols.get(name)
 
 
 class MockMarketDataFeed:
+    """Synchronous `get_latest_tick`, matching the real MarketDataEngine.
+
+    Production's `MarketDataEngine.get_latest_tick` is SYNC (core/domains/market_data/
+    engine.py), and that is what `RiskEngine._feed_tick` calls directly. This mock was
+    async, so the engine could not read a price, the post-liquidation recompute raised
+    "no usable bid price", and the test only passed because R13's fallback then fabricated
+    a recovery. The mock now models what production actually passes.
+    """
+
     def __init__(self, ticks: Dict[str, Tick] = None):
         self.ticks = ticks or {}
-    
-    async def get_latest_tick(self, symbol: str) -> Optional[Tick]:
+
+    def get_latest_tick(self, symbol: str) -> Optional[Tick]:
+        return self.ticks.get(symbol)
+
+    async def get_latest_tick_async(self, symbol: str) -> Optional[Tick]:
         return self.ticks.get(symbol)
 
 

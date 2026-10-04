@@ -14,7 +14,19 @@ from core.domains.identity.rights import (
 #: MT5's own "no margin" display. Comparisons against real thresholds must treat this
 #: as "unlimited", never as a number to be exceeded.
 MARGIN_LEVEL_UNLIMITED = Decimal('999999')
+#: MT5's own margin thresholds, in PERCENT, from the live export
+#: (`MarginCall "50.00"`, `MarginStopOut "30.00"`).
+#:
+#: R11: these existed as FIVE different literals - the dataclass defaulted to 80/50 while the
+#: loader, the mapper and the live export all said 50/30. An account whose group failed to load
+#: was therefore stopped out at 50% instead of 30%, keeping it trading 20 percentage points past
+#: the configured floor. Falling back to a MORE PERMISSIVE number is the wrong direction for a
+#: risk system, so there is now exactly one definition and every site reads it.
 from .enums import AccountType, SOActivation, FreeMarginMode
+from .thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
 from .value_objects import StopOutSnapshot
 from .group import Group
 
@@ -283,13 +295,48 @@ class Account:
         candidates = [int(v) for v in (mine, theirs) if v is not None]
         return min(candidates) if candidates else None
 
-    def effective_leverage(self) -> int:
-        """Get effective leverage (Account > Group > Default)."""
+    def effective_leverage(self, symbol: Any = None) -> int:
+        """THE effective leverage for this account. One resolver, for every caller.
+
+        Semantics: the account's own leverage is the BASE, the group's
+        ``leverage_default`` is the FALLBACK when the account has none, and the group's
+        ``leverage_max`` is a CAP applied on top. The cap is the part that was missing.
+
+        ``leverage_default`` is NOT a cap. Folding it into the same ``min()`` as the
+        maximum gives ``min(1000, 100, 500) = 100`` where MT5 gives 500, and would silently
+        charge five times the intended margin on every account whose leverage sits above
+        the group default.
+
+        The previous version ignored ``leverage_max`` entirely while the pre-trade gate
+        applied it, so the gate and the book disagreed by 10x: ``margin_used`` understated,
+        ``margin_level`` overstated, and stop-out late or never. Group
+        ``leverage_max = 500`` is the seeded default, so this was the ordinary case.
+
+        Two resolvers will always eventually disagree, so this is the ONLY one:
+        ``PreTradeRiskService._resolve_leverage`` delegates here.
+
+        ``symbol`` is accepted for a future per-symbol cap and is deliberately NOT read
+        from a ``leverage_max`` attribute today - ``Symbol`` has no such field, and the old
+        code's read of it could never fire. A branch that looks like protection it does not
+        provide is worse than no branch at all.
+        """
+        margin = getattr(self.group, "margin", None)
+
+        base = 0
         if self.leverage is not None and self.leverage > 0:
-            return self.leverage
-        if self.group and self.group.margin.leverage_default > 0:
-            return self.group.margin.leverage_default
-        return 100
+            base = int(self.leverage)
+        else:
+            default = getattr(margin, "leverage_default", 0) or 0
+            if default > 0:
+                base = int(default)
+
+        if base <= 0:
+            base = 100
+
+        maximum = getattr(margin, "leverage_max", 0) or 0
+        if maximum > 0:
+            return min(base, int(maximum))
+        return base
     
     def recompute_margin_level(self) -> Decimal:
         """Recompute margin level as a PERCENT, and store it.
@@ -314,15 +361,22 @@ class Account:
             self.margin_level = (self.equity.amount / self.margin_used.amount) * Decimal('100')
         return self.margin_level
 
-    def update_equity(self, unrealized_pnl: Money) -> None:
-        """Update equity based on unrealized P&L."""
-        self.profit = unrealized_pnl
-        self.equity = Money(
-            self.balance.amount + self.credit.amount + unrealized_pnl.amount,
-            self.currency
-        )
-        
-        # Update free margin based on Group's free_margin_mode
+    def recompute_free_margin(self, unrealized_pnl: Optional[Money] = None) -> None:
+        """THE free-margin rule. ONE home, honouring the group's FreeMarginMode.
+
+        R15/R19 consolidation. This ladder existed in `update_equity`, while the rest
+        of the codebase wrote `equity - margin_used` by hand at more than a dozen call
+        sites - each ignoring the group's mode. A broker that bills margin differently
+        per group cannot have two answers for the same account, so every caller now
+        points here.
+
+        `unrealized_pnl` is consulted only by the PROFIT and LOSS modes; a caller
+        without one passes None, which those modes read as zero.
+        """
+        pnl_amount = unrealized_pnl.amount if unrealized_pnl is not None else Decimal("0")
+        used = self.margin_used.amount
+
+    # Update free margin based on Group's free_margin_mode
         if self.group:
             mode = self.group.margin.free_margin_mode
             if mode == FreeMarginMode.USE_PL:
@@ -336,13 +390,13 @@ class Account:
                     self.currency
                 )
             elif mode == FreeMarginMode.PROFIT:
-                pnl_amount = max(unrealized_pnl.amount, Decimal('0'))
+                pnl_amount = max(pnl_amount, Decimal('0'))
                 self.margin_free = Money(
                     self.balance.amount + self.credit.amount + pnl_amount - self.margin_used.amount,
                     self.currency
                 )
             elif mode == FreeMarginMode.LOSS:
-                loss_amount = min(unrealized_pnl.amount, Decimal('0'))
+                loss_amount = min(pnl_amount, Decimal('0'))
                 self.margin_free = Money(
                     self.balance.amount + self.credit.amount + loss_amount - self.margin_used.amount,
                     self.currency
@@ -352,14 +406,33 @@ class Account:
                 self.equity.amount - self.margin_used.amount,
                 self.currency
             )
+
+    # R19: delegate. This inlined the SAME formula as `recompute_margin_level`,
+    # contradicting that method's own docstring ("This is the ONLY place the margin
+    # level formula lives"). Two copies inside one entity is how they drift.
+
+    def update_equity(self, unrealized_pnl: Money) -> None:
+        """Update equity, free margin and margin level from an unrealised PnL.
+
+        NOTE ON `margin_reserved` (audit R19): this deliberately does NOT subtract the
+        reserved hold. `PreTradeRiskService` computes `available = margin_free -
+        margin_reserved` when it gates an order, so subtracting it here as well would
+        count the SAME hold twice and refuse orders the account can actually afford. The
+        entity keeps `margin_free` free of the hold; the GATE applies it once, and
+        `reserve_margin`'s SQL applies it again atomically at the database.
+
+        The MARGIN LEVEL is delegated to `recompute_margin_level()` rather than re-derived
+        here, so the formula has exactly one home.
+        """
+        self.profit = unrealized_pnl
+        self.equity = Money(
+            self.balance.amount + self.credit.amount + unrealized_pnl.amount,
+            self.currency
+        )
         
-        # Update margin level
-        if self.margin_used.amount > Decimal('0'):
-            self.margin_level = (
-                self.equity.amount / self.margin_used.amount
-            ) * Decimal('100')
-        else:
-            self.margin_level = MARGIN_LEVEL_UNLIMITED
+        # R19: the FreeMarginMode ladder has ONE home.
+        self.recompute_free_margin(unrealized_pnl)
+        self.recompute_margin_level()
     
     def evaluate_margin_state(self) -> List[Dict[str, Any]]:
         """
@@ -538,4 +611,4 @@ class Account:
             "registration_date": self.registration_date.isoformat(),
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
-        }
+        }

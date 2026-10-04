@@ -256,8 +256,11 @@ class ValuationService:
                 snapshot = self.risk_engine.calculate_margin_level(
                     account, await self._as_position_entities(positions))
                 account.margin_used = Money(snapshot.margin_used, currency)
-                account.margin_free = Money(
-                    max(Decimal("0"), account.equity.amount - snapshot.margin_used), currency)
+                account.margin_used = Money(snapshot.margin_used, currency)
+                # R15 consolidation: the SNAPSHOT's own free margin, which the engine
+                # computed with the mode-aware ladder, instead of a hand-written
+                # subtraction with an extra clamp on top of it.
+                account.margin_free = Money(snapshot.margin_free, currency)
                 account.recompute_margin_level()
                 stats["margin_repaired"] = stats.get("margin_repaired", 0) + 1
                 logger.warning(

@@ -13,6 +13,12 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
+
 
 class GroupCreateRequest(BaseModel):
     model_config = ConfigDict(populate_by_name=True, extra="forbid")
@@ -26,8 +32,8 @@ class GroupCreateRequest(BaseModel):
     currency: str = "USD"
     leverage_default: int = 100
     leverage_max: int = 500
-    margin_call_level: Decimal = Decimal("80")
-    stop_out_level: Decimal = Decimal("50")
+    margin_call_level: Decimal = DEFAULT_MARGIN_CALL_LEVEL  # R11
+    stop_out_level: Decimal = DEFAULT_STOP_OUT_LEVEL  # R11
     trade_allowed: bool = True
 
 

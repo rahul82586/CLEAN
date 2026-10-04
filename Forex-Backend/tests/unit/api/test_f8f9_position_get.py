@@ -128,6 +128,29 @@ def _position(
     return pos
 
 
+class _ManagerRepo:
+    """A manager repository holding ONE real manager - the token's subject.
+
+    `get_current_manager` resolves a Bearer token's `sub` against this. The fixture used to
+    register no manager repository at all and mint a token for login 800001, which does not
+    exist; it worked only because the client-plane resolver fabricated an account (R7).
+    """
+
+    def __init__(self, login: str = "800001"):
+        from core.domains.identity.models import ManagerAccount, ManagerRole
+
+        self._manager = ManagerAccount(
+            manager_id=str(login),
+            login=str(login),
+            role=ManagerRole.SUPER_ADMIN,
+            is_active=True,
+            must_change_password=False,
+            allowed_ips=[],
+        )
+
+    async def find_by_login(self, login, session=None):
+        return self._manager if str(login) == str(self._manager.login) else None
+
 @pytest.fixture()
 def world():
     """A book shaped like the live one: two accounts, a real venue ticket,
@@ -150,6 +173,9 @@ def world():
         "manager_positions_query_handler": handler,
         "account_repo": None,
         "token_blacklist": None,
+        # The token below is for manager 800001; it must resolve to a REAL manager. Without
+        # this the fixture relied on get_current_user fabricating an account (R7).
+        "manager_repo": _ManagerRepo("800001"),
     })
     app = FastAPI()
     app.include_router(manager_main.router)

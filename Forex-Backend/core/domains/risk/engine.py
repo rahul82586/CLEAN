@@ -40,6 +40,10 @@ from ..accounts.models import Account
 from ..oms.entities.position import Position
 from ...ports.interfaces import IMarketDataFeed, ISymbolRepository
 from .models import MarginSnapshot, RiskStatus
+from core.domains.accounts.thresholds import (
+    DEFAULT_MARGIN_CALL_LEVEL,
+    DEFAULT_STOP_OUT_LEVEL,
+)
 from core.domains.market_data.quote_freshness import (
     DEFAULT_MAX_TICK_AGE_SECONDS,
     resolve_max_tick_age_seconds,
@@ -196,6 +200,12 @@ class RiskEngine:
             )
         previous_engine = self.market_data_engine
         if market_feed is not None:
+            # R24: this temporarily REBINDS shared state on the engine. It is safe only
+            # because NOTHING AWAITS inside the window, so no other task can observe the
+            # substituted feed. The audit flags it: one added `await` makes it a
+            # cross-account data race. A structural fix (passing the feed as a parameter)
+            # would change three public signatures, so the INVARIANT is recorded here at
+            # the point the window opens, which is where a future edit would break it.
             self.market_data_engine = market_feed
         try:
             direct = self._pair_rate(from_currency, to_currency, side)
@@ -366,7 +376,10 @@ class RiskEngine:
         )
 
     def calculate_margin_level(
-        self, account: Account, positions: Sequence[Position]
+        self,
+        account: Account,
+        positions: Sequence[Position],
+        orders: Optional[Sequence[Any]] = None,
     ) -> MarginSnapshot:
         """Real-time margin level for an account (the fast local layer).
 
@@ -376,6 +389,18 @@ class RiskEngine:
 
         Margin is MT5 MAINTENANCE margin over the open positions, aggregated per symbol
         with netting and hedged volume handled by the engine.
+
+        R3: `orders` carries the account's OPEN PENDING ORDERS. They used to be invisible
+        here, so a resting pending contributed ZERO margin: `margin_used` omitted it,
+        `margin_level` was overstated, and neither margin call nor stop-out could ever be
+        triggered by pending exposure. MT5 includes working orders in Margin and in the
+        margin level.
+
+        `order.is_pending` and `OrderType`'s values are used directly - `BUY_LIMIT`,
+        `SELL_STOP` and the rest are the exact spellings the margin calculator expects, so
+        no mapping table is invented here.
+
+        Passing `orders=None` reproduces the previous behaviour exactly.
         """
         unrealized = Decimal("0")
         legs: List[Leg] = []
@@ -416,6 +441,66 @@ class RiskEngine:
                 )
             )
 
+        # --- R3: resting pending orders contribute margin too --------------
+        #
+        # MT5's own rule, quoted in `margin.calculate_account_margin`: "For pending orders,
+        # the initial margin is always checked." The calculator has always handled these,
+        # but nothing ever built one - `is_pending=True` had NO production occurrence, so
+        # the pending branch of the calculator was unreachable outside tests.
+        #
+        # A pending cannot add to `unrealized`: it is not filled, so it has no PnL.
+        for order in (orders or ()):
+            try:
+                if not getattr(order, "is_pending", None):
+                    continue
+                symbol_name = str(getattr(order, "symbol", "") or "")
+                if not symbol_name:
+                    continue
+
+                # A pending that has already come to rest outside the book is not exposure.
+                state = getattr(getattr(order, "state", None), "value", None)
+                if str(state or "").upper() in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED"):
+                    continue
+
+                volume = getattr(order, "volume_current", None)
+                volume_value = getattr(volume, "value", volume)
+                if volume_value is None:
+                    continue
+                volume_value = Decimal(str(volume_value))
+                if volume_value <= 0:
+                    continue
+
+                spec = self._spec(symbol_name)
+                specs[symbol_name] = spec
+
+                order_type = getattr(order, "order_type", None)
+                operation = str(getattr(order_type, "value", order_type) or "")
+                if not operation:
+                    continue
+
+                price = getattr(getattr(order, "price_order", None), "value", None)
+                if price is None:
+                    continue
+
+                legs.append(
+                    Leg(
+                        symbol=symbol_name,
+                        operation=operation,
+                        volume=volume_value,
+                        price=Decimal(str(price)),
+                        is_pending=True,
+                        spec=spec,
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001
+                # A pending that cannot be costed must not silently vanish: silently
+                # dropping it is the exact defect this block exists to fix. It is logged,
+                # and the rest of the book is still costed.
+                logger.error(
+                    "could not include pending order %s in the margin snapshot: %s",
+                    getattr(order, "ticket_id", "?"), exc,
+                )
+
         leverage = account.effective_leverage()
         breakdown = calculate_account_margin(
             legs,
@@ -427,7 +512,17 @@ class RiskEngine:
         )
 
         equity = account.balance.amount + account.credit.amount + unrealized
-        margin_used = breakdown.total
+        # R27: apply the FLOATING-LEVERAGE coefficient.
+        #
+        # MT5: floating leverage "allows you to change leverage by applying an
+        # ADDITIONAL COEFFICIENT to the initial and maintenance margin values calculated
+        # in accordance with the symbol settings". The tier does NOT replace the formula -
+        # it multiplies what the symbol settings already produced.
+        #
+        # `select_rates` returns rates of exactly 1 with `applied=False` when no profile
+        # is configured, so a group without tiers is bit-for-bit unchanged.
+        tier = self._leverage_tier_result(account, positions, specs)
+        margin_used = tier.maintenance_margin(breakdown.total)
         level = compute_margin_level(equity, margin_used)
         margin_free = equity - margin_used
 
@@ -435,8 +530,10 @@ class RiskEngine:
             status = RiskStatus.NORMAL
         else:
             profile = getattr(account.group, "margin", None) if account.group else None
-            call_level = Decimal(str(profile.margin_call_level)) if profile else Decimal("80")
-            stop_level = Decimal(str(profile.stop_out_level)) if profile else Decimal("50")
+            call_level = (Decimal(str(profile.margin_call_level)) if profile
+                      else DEFAULT_MARGIN_CALL_LEVEL)
+            stop_level = (Decimal(str(profile.stop_out_level)) if profile
+                      else DEFAULT_STOP_OUT_LEVEL)
             if level < stop_level:
                 status = RiskStatus.STOPPED_OUT
             elif level < call_level:
@@ -458,6 +555,78 @@ class RiskEngine:
     # Thresholds
     # ------------------------------------------------------------------
 
+    def _leverage_tier_result(self, account, positions, specs):
+        """The floating-leverage coefficient for this account, or a neutral one.
+
+        R27: `core/domains/market_data/leverage_tiers.py` had NO production caller, so MT5
+        floating leverage had no effect at all. The profile is read from the group
+        (`mt5_extra["leverage_tiers"]`) and the coefficient is applied on top of the symbol
+        settings, which is what MT5 means by an "additional coefficient".
+
+        Never raises: a profile problem is logged and the caller proceeds with the neutral
+        pair. Refusing every margin calculation on a bad tier table would halt the whole
+        book rather than one setting.
+        """
+        from core.domains.market_data.leverage_tiers import (
+            LeverageTierResult,
+            select_rates,
+        )
+
+        try:
+            group = getattr(account, "group", None)
+            profile = getattr(group, "leverage_profile", None)
+            if profile is None:
+                return LeverageTierResult()
+
+            # MT5: the tiers "do not apply for groups with exchange calculation type".
+            # The group knows its own account type; the engine does not.
+            account_type = str(getattr(group, "account_type", "") or "").upper()
+            is_exchange = "EXCHANGE" in account_type
+
+            volumes = {}
+            notionals = {}
+            for position in positions:
+                name = position.symbol
+                volume = getattr(getattr(position, "volume", None), "value", None)
+                if volume is None:
+                    continue
+                volume = Decimal(str(volume))
+                volumes[name] = volumes.get(name, ZERO) + volume
+                try:
+                    spec = specs.get(name) or self._spec(name)
+                    price = getattr(getattr(position, "price_open", None), "value", None)
+                    if price is None:
+                        continue
+                    value = volume * spec.contract_size * Decimal(str(price))
+                    if spec.margin_currency and spec.margin_currency != account.currency:
+                        value = value * self._rate_lookup(
+                            spec.margin_currency, account.currency, "BUY"
+                        )
+                    notionals[name] = notionals.get(name, ZERO) + value
+                except Exception:  # noqa: BLE001
+                    # Without a rate the notional cannot be compared to a Notional-value
+                    # tier, so no notional entry is recorded and a notional rule simply
+                    # does not match. Volume-based rules are unaffected.
+                    continue
+
+            for name in volumes:
+                return select_rates(
+                    profile,
+                    symbol_name=name,
+                    volumes=volumes,
+                    notionals=notionals,
+                    is_exchange_group=is_exchange,
+                )
+            return LeverageTierResult()
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "could not evaluate floating leverage for account %s: %s; continuing "
+                "with the symbol rates unchanged",
+                getattr(account, "login", "?"), exc,
+            )
+            return LeverageTierResult()
+
+
     def _thresholds(self, account: Account) -> "tuple[Decimal, Decimal]":
         """(margin_call, stop_out) in PERCENT, from group.margin.*.
 
@@ -467,9 +636,23 @@ class RiskEngine:
         """
         profile = getattr(account.group, "margin", None) if account.group else None
         if profile is None:
-            return Decimal("80"), Decimal("50")
+            return DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL
         return Decimal(str(profile.margin_call_level)), Decimal(str(profile.stop_out_level))
 
+
+
+    # R25: KEPT ON PURPOSE, though it has no production caller.
+    #
+    # The audit lists this among three dead methods. The other two are thin
+    # wrappers and were removed. This one is different: its docstring documents the
+    # CORRECT worst-loss-first-and-stop-early algorithm, and it values PnL through
+    # `position_pnl` with real currency conversion - which the live planner did NOT
+    # do until R4 fixed it. Deleting it would remove the only place the intended
+    # algorithm is written down, and a future reader would have nothing to compare
+    # the live planner against.
+    #
+    # It stays as the reference implementation. If the two ever disagree again,
+    # that is the signal that the live path has drifted.
     def detect_margin_call(self, account: Account, snapshot: MarginSnapshot) -> bool:
         call_level, _ = self._thresholds(account)
         return snapshot.margin_level < call_level
@@ -477,10 +660,6 @@ class RiskEngine:
     def detect_stop_out(self, account: Account, snapshot: MarginSnapshot) -> bool:
         _, stop_level = self._thresholds(account)
         return snapshot.margin_level < stop_level
-
-    # ------------------------------------------------------------------
-    # Liquidation selection
-    # ------------------------------------------------------------------
 
     def select_positions_for_liquidation(
         self,
@@ -498,6 +677,12 @@ class RiskEngine:
         PnL is converted to the deposit currency before sorting. The previous version
         sorted on unconverted PnL, so on a USD account a -100,000 JPY loss (~-$667)
         ranked as worse than a -$900 loss and the wrong position was closed first.
+            # R24: this temporarily REBINDS shared state on the engine. It is safe only
+            # because NOTHING AWAITS inside the window, so no other task can observe the
+            # substituted feed. The audit flags it: one added `await` makes it a
+            # cross-account data race. A structural fix (passing the feed as a parameter)
+            # would change three public signatures, so the INVARIANT is recorded here at
+            # the point the window opens, which is where a future edit would break it.
         """
         previous_repo = self.symbol_repo
         previous_engine = self.market_data_engine
