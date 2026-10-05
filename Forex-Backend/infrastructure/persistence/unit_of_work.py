@@ -15,18 +15,53 @@ class _SharedSessionFactory:
 
     The session's lifecycle is NOT owned here: ``UnitOfWork.__aexit__`` commits or rolls
     back and closes it. A factory that closed the session on first use would end the
-    transaction part-way through, which is the failure mode this exists to prevent.
+    transaction part-way through, which is the failure mode this exists to prevent - and
+    returning the raw AsyncSession did exactly that, because repository code universally
+    does ``async with self.session_factory() as sess:`` and ``AsyncSession.__aexit__``
+    CLOSES the session. That was C11: ``SqlAccountRepository.find_by_login`` reaches
+    ``SqlGroupRepository.find_by_name`` internally, find_by_name took the factory path,
+    and the shared session was closed mid-fill - rolling the half-written transaction
+    back. The order/deal/position writes died there while the account row, merged after
+    the close, rode a fresh transaction to the UoW's commit: order stuck PLACED, no
+    deal, no position, account updated, DealCreated still published.
+
+    So ``__call__`` hands out THIS scope, not the raw session. It forwards every
+    operation to the shared session but owns none of its lifecycle:
+
+    * ``__aexit__`` / ``close()`` do not close - ``UnitOfWork.__aexit__`` does, once;
+    * ``commit()`` becomes ``flush()`` - a repository that commits its own block keeps
+      its writes visible inside the one transaction, while durability arrives with the
+      single commit at the end. A real commit here would tear the unit of work apart
+      just as surely as a close.
     """
 
     def __init__(self, session) -> None:
         self._session = session
 
     def __call__(self):
-        return self._session
+        # `async with self.session_factory() as sess:` enters the scope, so `sess` is
+        # this proxy: operations forward, exit/close/commit are the neutralised ones.
+        return self
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        # Never close the shared session, never swallow the exception: the unit of
+        # work's own __aexit__ sees it and rolls the whole transaction back.
+        return False
+
+    async def commit(self):
+        await self._session.flush()
+
+    async def close(self):
+        # No-op: closing the shared session would roll back the open transaction.
+        pass
 
     def __getattr__(self, name):
-        # Anything else a repository might expect of a sessionmaker (e.g. `.kw`) falls
-        # through to the session itself rather than raising AttributeError.
+        # Anything else a repository might expect of a sessionmaker or a session
+        # (execute, merge, get, scalars, `.kw`, ...) falls through to the session
+        # itself rather than raising AttributeError.
         return getattr(self._session, name)
 
 

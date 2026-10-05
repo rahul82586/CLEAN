@@ -346,8 +346,15 @@ class RecordDealHandler:
         margin_mode = getattr(getattr(account.group, 'margin', None), 'mode', None)
         group_mode = margin_mode  # HEDGING or NETTING, per EnMarginMode
 
-        # Fetch symbol for contract size
-        symbol = await self.symbol_repo.find_by_name(deal.symbol)
+        # Fetch symbol for contract size - C11: inside the unit of work when we have
+        # one, so the read joins the fill's ONE transaction instead of opening a second
+        # session mid-flight (on a shared connection that second session's close can
+        # roll the UoW's uncommitted writes back; on its own connection it reads a
+        # snapshot the fill has not committed yet).
+        if _accepts_session(self.symbol_repo.find_by_name):
+            symbol = await self.symbol_repo.find_by_name(deal.symbol, session=session)
+        else:
+            symbol = await self.symbol_repo.find_by_name(deal.symbol)
         if not symbol:
             raise ValueError(f"Symbol {deal.symbol} not found for position calculation")
 
@@ -703,7 +710,11 @@ class RecordDealHandler:
             if position.volume.value == 0:
                 continue
 
-            symbol = await self.symbol_repo.find_by_name(position.symbol)
+            # C11: same-transaction symbol read when running inside a unit of work.
+            if _accepts_session(self.symbol_repo.find_by_name):
+                symbol = await self.symbol_repo.find_by_name(position.symbol, session=session)
+            else:
+                symbol = await self.symbol_repo.find_by_name(position.symbol)
             if not symbol:
                 # A position in a symbol that is not configured cannot be margined. Log it
                 # loudly rather than skipping it silently: skipping understates the
@@ -790,7 +801,10 @@ class RecordDealHandler:
                 _vol_val = Decimal(str(_vol_val))
                 if _vol_val <= 0:
                     continue
-                _symbol = await self.symbol_repo.find_by_name(_sym_name)
+                if _accepts_session(self.symbol_repo.find_by_name):
+                    _symbol = await self.symbol_repo.find_by_name(_sym_name, session=session)
+                else:
+                    _symbol = await self.symbol_repo.find_by_name(_sym_name)
                 if not _symbol:
                     logger.error(
                         "pending order %s is in unconfigured symbol %s; it cannot be "

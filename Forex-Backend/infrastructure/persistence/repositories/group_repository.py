@@ -1,6 +1,7 @@
 from typing import List, Optional
 from decimal import Decimal
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 from core.domains.accounts.models import Group
 from core.ports.interfaces import IGroupRepository
 from ..mappers import group_to_db, db_to_group
@@ -52,7 +53,21 @@ class SqlGroupRepository(IGroupRepository):
         return model
 
 
-    async def find_by_name(self, name: str) -> Optional[Group]:
+    async def find_by_name(self, name: str, session: Optional[AsyncSession] = None) -> Optional[Group]:
+        # C11: callers inside a unit of work pass their session so this read joins the
+        # ONE transaction. Without the parameter this method opened
+        # `async with self.session_factory()` - inside a UoW that factory hands out the
+        # shared session, and AsyncSession's context-manager exit CLOSES it, rolling the
+        # half-written fill back (see _SharedSessionFactory).
+        if session is not None:
+            result = await session.execute(
+                select(GroupModel).where(GroupModel.name == name)
+            )
+            model = result.scalar_one_or_none()
+            if not model:
+                return None
+            return db_to_group(model)
+
         async with self.session_factory() as session:
             result = await session.execute(
                 select(GroupModel).where(GroupModel.name == name)

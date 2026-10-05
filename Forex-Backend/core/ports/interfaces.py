@@ -178,6 +178,19 @@ class IAccountRepository(ABC, Generic[T]):
         """
         raise NotImplementedError
 
+    async def adjust_balance(self, login_id: Any, delta: Any):
+        """Atomically add `delta` (may be negative) to the account balance (R20).
+
+        MUST be a single `balance = balance + delta` UPDATE in SQL
+        implementations, so a concurrent writer (a fill, a deposit, another
+        manager action) cannot be rolled back by a stale full-row save - the
+        lost update this replaces. Returns the NEW balance, or None when the
+        account does not exist. The base declaration raises NotImplementedError:
+        callers probe with getattr and fall back to a read-modify-write save,
+        logging that they did.
+        """
+        raise NotImplementedError
+
 
 class IOrderRepository(ABC, Generic[T]):
     """
@@ -646,8 +659,14 @@ class IGroupRepository(ABC, Generic[T]):
         )
 
     @abstractmethod
-    async def find_by_name(self, name: str) -> Optional[T]:
-        """Retrieves a group by MT5 path-style name, e.g. 'real\\real'."""
+    async def find_by_name(self, name: str, session: Optional[Any] = None) -> Optional[T]:
+        """Retrieves a group by MT5 path-style name, e.g. 'real\\real'.
+
+        `session` is the C11 unit-of-work participation: callers inside a transaction
+        pass their session so the read joins it. Optional like `save`'s - callers probe
+        with `_accepts_session` and fall back to the plain call, so repositories (and
+        test doubles) that predate the parameter keep working.
+        """
         pass
 
     @abstractmethod

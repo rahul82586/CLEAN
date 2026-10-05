@@ -418,43 +418,37 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
                     "be hedged externally", _default_destination.value,
                 )
 
-            # C11: `uow_factory` is deliberately NOT passed, and this is a known open
-            # defect rather than an oversight.
+            # C11: one transaction around a fill. `uow_factory` used to be deliberately
+            # NOT passed here, because the UoW path was broken: inside a unit of work the
+            # repositories are bound to a shared-session factory, and any repo method that
+            # fell back to `async with self.session_factory()` got the shared AsyncSession
+            # itself - whose context-manager exit CLOSES it. SqlAccountRepository.
+            # find_by_login reaches SqlGroupRepository.find_by_name that way, so every
+            # fill closed its own unit of work mid-transaction: the order/deal/position
+            # writes were rolled back while the account row, merged after the close, rode
+            # a fresh transaction to the commit. Order stuck PLACED, no deal, no position,
+            # account updated, DealCreated still published - a silent tear.
             #
-            # The plumbing is complete - `setup_persistence_di` defines and registers it
-            # (infrastructure/persistence/di_setup.py:60-64,82), `build_trading_stack`
-            # accepts and forwards it (:202,:396,:413), `RecordDealHandler.execute` uses it
-            # (:165), and `create_account` already refuses a deposit without it. Passing it
-            # here is one line. It is NOT passed because doing it breaks fills:
-            #
-            #   tests/integration/test_c11_transaction.py (xfail) proves that with a UoW the
-            #   order stays PLACED and NO deal and NO position row is written, while the
-            #   account row IS updated. Instrumenting UnitOfWork.commit shows why: the unit
-            #   of work's session identity map contains ONLY AccountModel - the order, deal
-            #   and position merges never reach that session, so its commit has nothing to
-            #   flush for them. `execute()` still returns a Deal and still publishes
-            #   DealCreated, so the failure is silent.
-            #
-            # That path has never run in production, which is why nobody hit it. Enabling it
-            # needs its own change: find where the three merges are being routed, fix it, and
-            # turn the xfail test into a passing one FIRST.
-            #
-            # Consequence of leaving it off, stated plainly: a fill is five or six
-            # independent commits, so a crash between them can leave an order FILLED with no
-            # deal behind it, or a deal with no position, or a position with no margin update.
+            # Fixed at the root: _SharedSessionFactory now hands out a scope that never
+            # closes the session and downgrades a repo's own commit() to flush() (see
+            # unit_of_work.py), and the nested group/symbol reads inside a fill thread the
+            # UoW session explicitly. Order, deal, position and account now commit
+            # together or not at all - proven by
+            # tests/integration/test_c11_transaction.py (no longer xfail).
             stack = await build_trading_stack(
                 container,
                 market_data_engine=market_data_engine,
                 config_cache=cache,
                 default_destination=_default_destination,
+                uow_factory=_container_lookup("uow_factory"),
             )
-            logger.warning(
-                "C11 OPEN: no unit of work around a fill - order, deal, position and "
-                "account are written as separate commits, so a crash between them leaves "
-                "torn state. Passing uow_factory is NOT the fix: the UoW path currently "
-                "persists only the account row (see "
-                "tests/integration/test_c11_transaction.py)."
-            )
+            if _container_lookup("uow_factory") is None:
+                logger.warning(
+                    "C11 DEGRADED: no uow_factory in the container - fills fall back to "
+                    "independent per-repository commits, so a crash between them leaves "
+                    "torn state (order FILLED with no deal, deal with no position). "
+                    "Check setup_persistence_di registration."
+                )
             register_di_providers(stack.as_providers())
             register_di_providers({"market_data_engine": stack.market_data_engine})
             app.state.trading_stack = stack
