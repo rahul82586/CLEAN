@@ -77,35 +77,34 @@ class SyncSymbolView:
 
 
 # ---------------------------------------------------------------------------------------
-# BOTH tests in this module are xfail(strict=True) on purpose.
+# C11 is FIXED: a fill is ONE transaction, and its event lands after the commit.
 #
-# C11 (no transaction around a fill) is an OPEN defect, not a fixed one. Enabling it is one
-# line - pass `uow_factory=_container_lookup("uow_factory")` to `build_trading_stack` in
-# api/main.py - and that line BREAKS fills:
+# Both tests below used to be locked (xfail/skip) because enabling the unit of work
+# broke fills: the order stayed PLACED, no deal row and no position row was written,
+# while the account row WAS updated and DealCreated still published - a silent tear.
 #
-#   * the order stays PLACED, and no deal row and no position row is written;
-#   * the account row IS updated, so margin_used/margin_reserved change;
-#   * `execute()` still returns a Deal and still publishes DealCreated, so nothing complains.
+# Root cause: repositories bound to a unit of work receive a shared-session factory,
+# and any repo method falling back to `async with self.session_factory() as sess:`
+# received the shared AsyncSession ITSELF - whose context-manager exit CLOSES it,
+# rolling the half-written transaction back. SqlAccountRepository.find_by_login reaches
+# SqlGroupRepository.find_by_name exactly that way, mid-fill, on every single deal.
 #
-# Instrumenting `UnitOfWork.commit` shows the cause: at commit time the unit of work's
-# session has `new=0, dirty=1` and its identity map contains ONLY AccountModel. The order,
-# deal and position merges never reach that session, so its commit has nothing to flush for
-# them. That has never been hit in production because `uow_factory` was never passed.
+# The fix, in three layers:
+#   * _SharedSessionFactory now hands out a scope that never closes the session and
+#     downgrades a repository's own commit() to flush() - the one real commit stays
+#     with UnitOfWork.__aexit__ (infrastructure/persistence/unit_of_work.py);
+#   * the nested group lookup (find_by_login -> find_by_name) and the fill's symbol
+#     reads thread the UoW session explicitly, so they join the one transaction
+#     instead of opening a second session on the shared connection;
+#   * api/main.py passes uow_factory to build_trading_stack, so production fills
+#     actually run through this path (the degraded case logs loudly).
 #
-# The rollback test below PASSES today, but vacuously - "nothing was written" trivially
-# satisfies "nothing survived the rollback". It is kept, and xfailed, so that both become
-# meaningful the moment the UoW integration is repaired. `strict=True` means this module
-# must be revisited if either test starts passing.
+# The third test pins the factory contract itself, so a future "simplification" back
+# to the raw session fails HERE instead of silently tearing fills in production.
 #
-# What IS fixed and covered elsewhere: C11a, the post-commit publish. `record_deal.execute`
-# now collects DealCreated and publishes it after the transaction boundary, so a subscriber
-# that opens its own session (ConfigCache._on_positions_changed) can no longer read a
-# database that has not committed. See tests/unit/domains/risk/test_rms_open_items.py.
+# C11a (post-commit publish) was already fixed and is asserted by the first test and
+# by tests/unit/domains/risk/test_rms_open_items.py.
 # ---------------------------------------------------------------------------------------
-_C11_REASON = (
-    "C11 OPEN: RecordDealHandler's unit-of-work path persists only the account row; the "
-    "order, deal and position merges never reach the UoW session"
-)
 
 
 @pytest.fixture
@@ -170,7 +169,6 @@ async def _prepare(factory):
 
 
 @pytest.mark.asyncio
-@pytest.mark.xfail(reason=_C11_REASON, strict=True, raises=AssertionError)
 async def test_c11_a_fill_commits_atomically_and_the_event_sees_it(db):
     order, account_repo, order_repo, symbol_repo, group = await _prepare(db)
     deal_repo = SqlDealRepository(db)
@@ -216,9 +214,6 @@ async def test_c11_a_fill_commits_atomically_and_the_event_sees_it(db):
 
 
 @pytest.mark.asyncio
-@pytest.mark.skip(reason=_C11_REASON + " - this rollback test PASSES today but vacuously: "
-                  "with nothing written, 'nothing survived the rollback' is trivially true. "
-                  "Un-skip it together with the xfail above once the UoW persists.")
 async def test_c11_a_failure_rolls_the_whole_fill_back(db):
     """The point of the transaction: a failure part-way leaves NO partial state."""
     order, account_repo, order_repo, symbol_repo, group = await _prepare(db)
@@ -263,3 +258,59 @@ async def test_c11_a_failure_rolls_the_whole_fill_back(db):
         "the reservation must survive the rollback - the order is still live"
     )
     assert "DealCreated" not in bus.events, "no event may be published for a rolled-back deal"
+
+
+@pytest.mark.asyncio
+async def test_c11_the_shared_session_scope_never_closes_or_commits_early(db):
+    """The factory contract the fill path depends on, pinned directly.
+
+    Repositories do `async with self.session_factory() as sess:` and some call
+    `sess.commit()` inside the block. Within a unit of work the factory must hand out a
+    scope that (a) does NOT close the shared session on exit, and (b) turns commit()
+    into flush() - so everything stays inside the ONE transaction until
+    UnitOfWork.__aexit__, and a rollback still undoes all of it.
+    """
+    from sqlalchemy import text
+
+    from infrastructure.persistence.mappers import group_to_db
+
+    group, _symbol = _seed()
+
+    # (a)+(b): scope exit / scope commit() / scope close() must not end the UoW
+    # transaction, and the rollback below must still undo the UoW's own write.
+    with pytest.raises(RuntimeError):
+        async with UnitOfWork(session_factory=db) as uow:
+            shared = uow.accounts.session_factory
+            await uow.session.merge(group_to_db(group))
+            async with shared() as sess:
+                await sess.execute(text("SELECT 1"))
+                await sess.commit()      # must flush, NOT commit
+                await sess.close()       # must be a no-op
+            assert uow.session.in_transaction(), (
+                "a repository block on the shared factory ended the unit of work's "
+                "transaction - the C11 close/commit landmine is back"
+            )
+            raise RuntimeError("boom")
+
+    async with db() as check:
+        count = (await check.execute(text("SELECT count(*) FROM groups"))).scalar()
+    assert count == 0, (
+        "the scope's commit() committed for real: a rolled-back unit of work left "
+        "persisted rows behind"
+    )
+
+    # The same scope usage inside a unit of work that COMMITS: the write made before
+    # the scope block must land with the single UoW commit.
+    async with UnitOfWork(session_factory=db) as uow:
+        shared = uow.accounts.session_factory
+        await uow.session.merge(group_to_db(group))
+        async with shared() as sess:
+            await sess.execute(text("SELECT 1"))
+            await sess.commit()
+
+    async with db() as check:
+        count = (await check.execute(text("SELECT count(*) FROM groups"))).scalar()
+    assert count == 1, (
+        "the UoW's single commit must persist writes made before a repository scope "
+        "block ran on the shared factory"
+    )

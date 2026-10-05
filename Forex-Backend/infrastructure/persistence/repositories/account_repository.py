@@ -11,6 +11,27 @@ from infrastructure.persistence.db_models import AccountModel, GroupModel
 from infrastructure.persistence.mappers import account_to_db, db_to_account, group_to_db, db_to_group
 
 
+def _accepts_session(method: Any) -> bool:
+    """Does this repository method take a `session` keyword argument?
+
+    Same probe record_deal uses (C11/D16): an explicit `session` parameter or
+    **kwargs. Test doubles and older repositories that predate the parameter
+    keep working through the plain call.
+    """
+    import inspect
+
+    try:
+        signature = inspect.signature(method)
+    except (TypeError, ValueError):
+        return False
+    for name, parameter in signature.parameters.items():
+        if name == "session":
+            return True
+        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
+            return True
+    return False
+
+
 class SqlAccountRepository(IAccountRepository):
     """PostgreSQL implementation of IAccountRepository."""
 
@@ -33,15 +54,34 @@ class SqlAccountRepository(IAccountRepository):
             model = await session.get(AccountModel, login_id)
             if not model:
                 return None
-            group = await self.group_repo.find_by_name(model.group_name) if self.group_repo else None
+            group = await self._find_group(model.group_name, session)
             return db_to_account(model, group)
 
         async with self.session_factory() as sess:
             model = await sess.get(AccountModel, login_id)
             if not model:
                 return None
-            group = await self.group_repo.find_by_name(model.group_name) if self.group_repo else None
+            group = await self._find_group(model.group_name, sess)
             return db_to_account(model, group)
+
+    async def _find_group(self, group_name: Any, session: Optional[AsyncSession] = None):
+        """The account's group, in the CALLER's session when one was passed.
+
+        C11: this used to call `group_repo.find_by_name(name)` unconditionally. Inside
+        a unit of work the group repository is bound to the shared session factory, and
+        find_by_name's `async with self.session_factory()` CLOSES the shared session on
+        exit - rolling the half-written fill back mid-flight. Passing the session keeps
+        the read inside the one transaction; the probe keeps repositories (and test
+        doubles) that predate the parameter working.
+        """
+        if self.group_repo is None:
+            return None
+        find = getattr(self.group_repo, "find_by_name", None)
+        if find is None:
+            return None
+        if session is not None and _accepts_session(find):
+            return await find(group_name, session=session)
+        return await find(group_name)
 
     async def reserve_margin(self, login_id: Any, amount: Any, session: Optional[AsyncSession] = None):
         """One conditional UPDATE: hold `amount` only while free margin covers it.
@@ -86,6 +126,37 @@ class SqlAccountRepository(IAccountRepository):
             "WHERE login = :login RETURNING margin_reserved"
         )
         params = {"amt": str(_D(str(amount))), "login": str(login_id)}
+        if session is not None:
+            row = (await session.execute(stmt, params)).first()
+        else:
+            async with self.session_factory() as sess:
+                row = (await sess.execute(stmt, params)).first()
+                await sess.commit()
+        return None if row is None else _D(str(row[0]))
+
+    async def adjust_balance(self, login_id: Any, delta: Any, session: Optional[AsyncSession] = None):
+        """R20: atomically add `delta` (Decimal, may be negative) to the balance.
+
+        One `balance = balance + :delta` UPDATE, so the database serialises
+        concurrent writers. The manager desk used to book PnL as a full-row
+        read-modify-write - `find_by_login`, `Money(balance + pnl)`, `save()` -
+        which commits the WHOLE snapshot it read: any balance movement that
+        landed between the read and the write (a fill, a deposit, another
+        manager action) was silently rolled back to the stale value. Same
+        lost update D8b fixed for margin_used, on the balance column.
+
+        Returns the NEW balance as a Decimal, or None when the account row
+        does not exist.
+        """
+        from decimal import Decimal as _D
+
+        from sqlalchemy import text as sa_text
+
+        stmt = sa_text(
+            "UPDATE accounts SET balance = balance + CAST(:delta AS DECIMAL(20,8)) "
+            "WHERE login = :login RETURNING balance"
+        )
+        params = {"delta": str(_D(str(delta))), "login": str(login_id)}
         if session is not None:
             row = (await session.execute(stmt, params)).first()
         else:
@@ -202,7 +273,7 @@ class SqlAccountRepository(IAccountRepository):
             models = result.scalars().all()
             accounts = []
             for model in models:
-                group = await self.group_repo.find_by_name(model.group_name)
+                group = await self._find_group(model.group_name, session)
                 accounts.append(db_to_account(model, group))
             return accounts
 
@@ -283,7 +354,7 @@ class SqlAccountRepository(IAccountRepository):
             for model in models:
                 group = None
                 if self.group_repo is not None and model.group_name:
-                    group = await self.group_repo.find_by_name(model.group_name)
+                    group = await self._find_group(model.group_name, sess)
                 rows.append(db_to_account(model, group))
             return rows, int(total)
 
@@ -301,7 +372,7 @@ class SqlAccountRepository(IAccountRepository):
             for model in models:
                 group = None
                 if self.group_repo is not None and model.group_name:
-                    group = await self.group_repo.find_by_name(model.group_name)
+                    group = await self._find_group(model.group_name, session)
                 out.append(db_to_account(model, group))
             return out
 

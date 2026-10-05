@@ -134,6 +134,48 @@ async def get_next_deal_ticket(deal_repo: Any = None) -> int:
         return _DEAL_COUNTER
 
 
+async def _persist_recalculated_valuation(account_repo: Any, acc: Account) -> None:
+    """R20: write back ONLY the columns this recalculation owns.
+
+    `recalculate_account_trading_state` derives profit / equity / margin_used /
+    margin_free / margin_level from a fresh read, then used to persist with a
+    full-row `save()`. That commits the whole snapshot: a balance movement
+    committed between this function's `find_by_login` and its write (a fill, a
+    deposit, another manager action) was rolled back to the stale value - the
+    D8b lost update, on the manager desk instead of the tick pipeline.
+
+    `update_valuation(include_margin=True)` writes the disjoint set - the
+    derived valuation, never balance / credit / margin_reserved. include_margin
+    is required because this function OWNS margin_used: the no-positions branch
+    zeroes it (R3 completion) and a valuation sweep must be able to repair it.
+
+    Falls back to save() only for repositories that lack the atomic setter
+    (in-memory test doubles), and says so in the log.
+    """
+    setter = getattr(account_repo, "update_valuation", None)
+    if setter is not None:
+        try:
+            await setter(acc, include_margin=True)
+            return
+        except NotImplementedError:
+            pass
+        except TypeError:
+            # Double with an update_valuation(account) signature but no
+            # include_margin kwarg: still a disjoint-column write, just
+            # without the margin repair.
+            try:
+                await setter(acc)
+                return
+            except Exception:
+                pass
+    logger.warning(
+        "R20: account_repo %s has no usable update_valuation(); falling back to a "
+        "full-row save - a concurrent balance write can be lost",
+        type(account_repo).__name__,
+    )
+    await account_repo.save(acc)
+
+
 async def recalculate_account_trading_state(
     acc_login: int,
     account_repo: Any,
@@ -180,7 +222,7 @@ async def recalculate_account_trading_state(
             acc.equity = Money(acc.balance.amount + acc.credit.amount, currency)
             acc.margin_free = Money(acc.equity.amount, currency)
             acc.recompute_margin_level()
-            await account_repo.save(acc)
+            await _persist_recalculated_valuation(account_repo, acc)
             return
 
         if risk_engine is not None:
@@ -193,7 +235,7 @@ async def recalculate_account_trading_state(
                 acc.profit = Money(snapshot.equity - (acc.balance.amount + acc.credit.amount), currency)
                 acc.margin_free = Money(snapshot.margin_free, currency)
                 acc.recompute_margin_level()
-                await account_repo.save(acc)
+                await _persist_recalculated_valuation(account_repo, acc)
                 return
             except Exception as engine_err:
                 logger.warning(f"recalculate_account_trading_state risk_engine notice: {engine_err}")
@@ -307,7 +349,7 @@ async def recalculate_account_trading_state(
         # FreeMarginMode. This wrote `max(0, equity - margin)` by hand.
         acc.recompute_free_margin()
         acc.recompute_margin_level()
-        await account_repo.save(acc)
+        await _persist_recalculated_valuation(account_repo, acc)
     except Exception as exc:
         logger.error(f"recalculate_account_trading_state error: {exc}")
 
@@ -659,11 +701,33 @@ async def handle_OrderClose_get(
 
                 # Update Account balance & release margin
                 if account_repo is not None:
-                    acc = await account_repo.find_by_login(acc_login)
-                    if acc is not None:
-                        new_bal = acc.balance.amount + pnl
-                        acc.balance = Money(new_bal, acc.currency)
-                        await account_repo.save(acc)
+                    # R20: book the PnL with one atomic `balance = balance + delta`
+                    # UPDATE. The old read-modify-write (find_by_login -> Money(balance
+                    # + pnl) -> full-row save) committed the WHOLE snapshot it read:
+                    # any balance movement that landed between the read and the write
+                    # - a fill, a deposit, another manager action on the same account -
+                    # was silently rolled back. Lost update on the real ledger.
+                    booked = False
+                    adjust = getattr(account_repo, "adjust_balance", None)
+                    if adjust is not None:
+                        try:
+                            new_balance = await adjust(acc_login, pnl)
+                            booked = True
+                            if new_balance is None:
+                                logger.warning(
+                                    f"OrderClose: account {acc_login} vanished before PnL booking"
+                                )
+                        except NotImplementedError:
+                            logger.warning(
+                                "OrderClose: account_repo %s has no atomic adjust_balance; "
+                                "falling back to a read-modify-write save (R20 lost-update risk)",
+                                type(account_repo).__name__,
+                            )
+                    if not booked:
+                        acc = await account_repo.find_by_login(acc_login)
+                        if acc is not None:
+                            acc.balance = Money(acc.balance.amount + pnl, acc.currency)
+                            await account_repo.save(acc)
                     await recalculate_account_trading_state(acc_login, account_repo, position_repo, symbol_repo, risk_engine)
 
                 return {
