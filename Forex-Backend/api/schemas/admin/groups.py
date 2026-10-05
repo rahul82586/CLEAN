@@ -13,7 +13,8 @@ from typing import List, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+# N10: the constants live in core.domains.accounts.thresholds;
+# the duplicate import from account.py shadowed the one below.
 from core.domains.accounts.thresholds import (
     DEFAULT_MARGIN_CALL_LEVEL,
     DEFAULT_STOP_OUT_LEVEL,

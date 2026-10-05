@@ -55,12 +55,30 @@ def build_tick_margin_pipeline(container: Any) -> TickMarginPipeline:
     module-level state, so that nothing touches the database or the event bus at
     import time and so that tests can build one against mocks.
     """
+    # R22/N8: the coalescing window existed but was never passed, so it stayed at its
+    # 0.0 default = disabled, and the pipeline still did a full read-modify-write per
+    # position per account on EVERY tick. Opt-in by environment because the right window
+    # depends on the feed's tick rate and the database's latency - measure it, do not
+    # guess it. Unset keeps the previous synchronous behaviour exactly.
+    import os
+
+    try:
+        coalesce = float(os.environ.get("TICK_MARGIN_COALESCE_SECONDS", "0") or 0)
+    except (TypeError, ValueError):
+        coalesce = 0.0
+    if coalesce > 0:
+        logger.info(
+            "TickMarginPipeline coalescing enabled: %.3fs trailing window per symbol",
+            coalesce,
+        )
+
     return TickMarginPipeline(
         position_repo=container.resolve(IPositionRepository),
         account_repo=container.resolve(IAccountRepository),
         symbol_repo=container.resolve(ISymbolRepository),
         risk_engine=container.resolve(RiskEngine),
         event_bus=container.resolve(IEventBus),
+        coalesce_seconds=coalesce,
     )
 
 

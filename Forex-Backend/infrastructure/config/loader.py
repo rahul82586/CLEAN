@@ -79,7 +79,8 @@ from core.domains.instruments.value_objects import MarginRates, QuoteSession, Tr
 
 from infrastructure.mt5 import enums as mt5enums
 
-from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+# N10: the constants live in core.domains.accounts.thresholds;
+# the duplicate import from account.py shadowed the one below.
 from infrastructure.mt5 import fieldmap
 from infrastructure.mt5.codec import EXTRA_KEY, SCALE_KEY, record_to_domain
 from infrastructure.mt5.wire import WEEKDAY_SUNDAY_FIRST, decode_file, records

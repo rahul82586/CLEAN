@@ -263,6 +263,13 @@ async def build_trading_stack(
         # MT5's "request time not on a holiday" rule never ran. The real repository is
         # already built and registered as `holiday_repo`; this passes it in.
         holiday_repo=_resolve(container, "holiday_repo", required=False),
+        # R9 completion: `limit_orders` is MT5's count of WORKING ORDERS. The check was
+        # fixed to read them, but the repository was never passed here, so
+        # `_count_live_orders` fell back to the POSITION count - the exact behaviour the
+        # fix's own comment calls wrong ("200 pending orders and no positions was
+        # allowed"). The manager path patched it in after the fact; the client path, which
+        # carries the real flow, did not.
+        order_repo=_resolve(container, "order_repo", required=False),
     )
 
     # M7: client pricing - group spread transforms (SpreadDiff/Balance, fixed

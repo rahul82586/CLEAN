@@ -338,10 +338,13 @@ class LiquidationWorker:
                 account, remaining_positions, _remaining_pendings
             )
         except Exception as exc:  # noqa: BLE001 - fall back, but say so loudly
+            # N9: this text described the pre-R13 behaviour. That fallback is gone - the
+            # account is now LEFT IN STOP-OUT with its margins untouched and an alarm is
+            # raised - so the log said the opposite of what the code does.
             logger.error(
                 "could not recompute margin for %s through the risk engine after "
-                "liquidation: %s. Falling back to per-position PnL with zero margin, "
-                "which will read as fully recovered - verify this account manually.",
+                "liquidation: %s. The account will be LEFT IN STOP-OUT with its margins "
+                "unchanged and an alarm raised; no recovery is assumed.",
                 account_login, exc,
             )
 
@@ -490,6 +493,7 @@ class LiquidationWorker:
                 target.cancel("stop-out: released reserved margin")
                 await self.order_repo.save(target)
                 await self._release_hold(account_login, hold)
+                await self._announce_cancellation(target, account_login, "stop-out")
                 cancelled += 1
                 logger.info("stop-out released pending order %s (reserved %s)",
                             getattr(target, "ticket_id", "?"), reserved(target))
@@ -498,13 +502,52 @@ class LiquidationWorker:
                 return cancelled
         return cancelled
 
+    async def _announce_cancellation(self, order: Any, account_login: int, reason: str) -> None:
+        """Publish OrderCancelled for a stop-out cancellation (audit R14 completion).
+
+        The row was cancelled and the hold released, but nothing was published - so the
+        client's terminal kept showing a working order that no longer existed, the
+        WebSocket bridge had nothing to push, and ConfigCache never refreshed. Every other
+        cancellation path in the codebase (`cancel_order.py`, `expiration_worker.py`)
+        publishes this event; a stop-out is not a reason to be quieter about it.
+
+        Never raises: a missed notification must not abort a liquidation that is already
+        releasing the client's margin.
+        """
+        try:
+            from core.events.domain_events import OrderCancelled
+
+            await self.event_bus.publish(
+                OrderCancelled(
+                    aggregate_id=getattr(order, "ticket_id", ""),
+                    payload={
+                        "ticket_id": getattr(order, "ticket_id", ""),
+                        "order_id": getattr(order, "ticket_id", ""),
+                        "account_login": str(account_login),
+                        "symbol": getattr(order, "symbol", ""),
+                        "volume_initial": str(
+                            getattr(getattr(order, "volume_initial", None), "value", "")
+                        ),
+                        "volume_current": str(
+                            getattr(getattr(order, "volume_current", None), "value", "")
+                        ),
+                        "reason": reason,
+                    },
+                )
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "could not publish OrderCancelled for stop-out cancellation of %s: %s",
+                getattr(order, "ticket_id", "?"), exc,
+            )
+
     async def _release_hold(self, account_login: int, hold: Any) -> None:
         """Atomically release a reservation, when the repository supports it.
 
         Uses `release_margin` rather than editing `margin_used`/`margin_reserved` in Python:
         the repository's version is a conditional SQL update, so two concurrent releases
-        cannot both succeed. Editing the attribute then saving the row is what the cancel
-        path does, and the audit lists it as the R5 leak.
+        cannot both succeed. (The cancel path used to edit the attributes and save the row -
+        that was the R5 leak, and it now calls this same helper.)
 
         A missing amount, a missing repository or a repository without `release_margin` is
         reported and skipped - never guessed at, because guessing here either strands margin
@@ -709,6 +752,12 @@ class LiquidationWorker:
             )
 
         # 3. Update Position
+        # H3: captured BEFORE the zeroing below. The PositionClosed payload used to read
+        # `position.volume.value` after this line had already set it to 0, so every
+        # liquidation told the client - and the WebSocket bridge, and anything downstream -
+        # that it had closed ZERO lots.
+        closed_volume = position.volume.value
+
         position.volume = Volume(Decimal('0'))
         position.time_done = datetime.now(timezone.utc)
         position.deal_close = closing_deal.deal_id
@@ -722,7 +771,7 @@ class LiquidationWorker:
                 "position_id": position.position_id,
                 "account_login": account.login,
                 "symbol": position.symbol,
-                "volume_closed": str(position.volume.value),
+                "volume_closed": str(closed_volume),
                 "close_price": str(current_price.value),
                 "realized_pnl": str(realised_pnl.amount if realised_pnl is not None else position.profit.amount),  # R4: converted, matching the deal and the balance
                 "deal_id": closing_deal.deal_id,

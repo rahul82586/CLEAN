@@ -35,8 +35,10 @@ from application.queries.get_account_info import (
 )
 from application.queries.get_positions import GetManagerPositionsQueryHandler, GetManagerPositionsQuery
 
-from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+# N10: the constants live in core.domains.accounts.thresholds;
+# the duplicate import from account.py shadowed the one below.
 from core.domains.accounts.account import MARGIN_LEVEL_UNLIMITED
+from core.domains.market_data.margin import margin_level as compute_margin_level
 from core.domains.accounts.thresholds import (
     DEFAULT_MARGIN_CALL_LEVEL,
     DEFAULT_STOP_OUT_LEVEL,
@@ -76,22 +78,38 @@ async def user_get(
     group = str(info.get("group", info.get("group_name", ""))) if isinstance(info, dict) else getattr(info, "group", "")
     acc_login = int(info.get("login_id", info.get("login", login))) if isinstance(info, dict) else getattr(info, "login_id", login)
     
-    # R15: the SENTINEL when no margin is in use, not 0. UserGet reported a flat
-    # account at level 0, which is below every stop-out threshold.
-    margin_level = MARGIN_LEVEL_UNLIMITED
-    if margin > 0:
-        margin_level = (equity / margin) * Decimal("100")
-    
+    # R15/C2: the shared function, which returns MARGIN_LEVEL_UNLIMITED for a zero
+    # requirement. UserGet used to report a flat account at level 0 - below every stop-out
+    # threshold - and this was the last inline copy of the formula outside the planner.
+    margin_level = compute_margin_level(equity, margin)
+
+    # The query already resolves BOTH of these from the account (`get_account_info.py:58`
+    # reads the balance currency, `:63` calls `effective_leverage()`), and this response
+    # ignored them: a EUR account was reported to the Manager terminal as USD, and every
+    # account was reported at 100x regardless of its own or its group's setting. A dealer
+    # reading either number would size a manual intervention wrongly.
+    currency = str(
+        info.get("currency", "USD") if isinstance(info, dict)
+        else getattr(info, "currency", "USD")
+    ) or "USD"
+    try:
+        leverage = int(
+            info.get("leverage", 100) if isinstance(info, dict)
+            else getattr(info, "leverage", 100)
+        )
+    except (TypeError, ValueError):
+        leverage = 100
+
     return AccountInfo(
         login=acc_login,
         group=group,
-        currency="USD",
+        currency=currency,
         balance=balance,
         equity=equity,
         margin=margin,
         free_margin=free_margin,
         margin_level=margin_level,
-        leverage=100,
+        leverage=leverage,
     )
 
 @router.get("/PositionGet", response_model=List[PositionInfo], summary="Get positions for account or login")

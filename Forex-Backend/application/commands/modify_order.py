@@ -85,27 +85,37 @@ class ModifyOrderHandler:
         new_price = command.new_price if command.new_price is not None else old_price
         margin_delta = Decimal('0')
 
+        new_margin = Decimal("0")
         if new_price != old_price:
-            # Calculate margin difference
-            # New margin - Old margin = Delta
-            volume = order.volume_current.value
-            contract_size = order.contract_size
-
-            # R16: do NOT re-derive the requirement with a local formula.
+            # N4: ASK THE RMS for both requirements. Do not scale by the price ratio.
             #
-            # This was `(price * volume * contract_size) / Decimal('100')` - the FOURTH
-            # independent margin formula in the codebase: hardcoded leverage 100, the CFD
-            # price term applied to Forex, no calc mode, no margin rate, no conversion.
+            # The previous fix replaced a local `/100` formula with
+            # `old_margin * (new_price / old_price)`, which is exact only for the
+            # price-dependent modes. Forex (CalcMode 0) and Forex-no-leverage (5) compute
+            # `volume * contract_size / leverage` with NO price term, so MT5 leaves their
+            # requirement untouched when a pending's price moves - while this scaled it.
+            # Measured: a 1000 hold became 1090.91 on a 1.10 -> 1.20 modify. 99 of the 362
+            # symbols in the live export use those two modes. Scaling DOWN was the worse
+            # direction, because it RELEASED margin that should have stayed held.
             #
-            # The reservation was already computed by `risk_service` and stored on the
-            # order, so scaling THAT by the price ratio is exact.
-            volume = order.volume_current.value
+            # `required_margin_for` runs the same stages 1-3 the order gate runs, including
+            # the operation's own margin rate, the currency conversion and the floating
+            # leverage coefficient, so a modify and a fresh order cost the same.
+            account = await self.account_repo.find_by_login(command.account_login)
+            if account is None:
+                raise ValueError(f"Account {command.account_login} not found")
+            new_margin = await self.risk_service.required_margin_for(
+                order, account, Price(new_price)
+            )
+            if new_margin is None:
+                # Fail CLOSED. An order whose new requirement cannot be computed must not be
+                # modified on a guessed number - that is how the /100 formula got here.
+                raise ValueError(
+                    f"Cannot modify {order.ticket_id}: the margin requirement at "
+                    f"{new_price} could not be computed for {order.symbol}"
+                )
             old_margin = Decimal(str(getattr(order, "reserved_margin", 0) or 0))
-            if old_price != 0 and old_margin > 0:
-                new_margin = old_margin * (new_price / old_price)
-                margin_delta = new_margin - old_margin
-            else:
-                margin_delta = Decimal("0")
+            margin_delta = new_margin - old_margin
 
         # 5. Modify the order (inside per-account lock)
         async with self.risk_service.account_lock(command.account_login):
@@ -164,7 +174,10 @@ class ModifyOrderHandler:
                             account=account,
                         )
                     # The order now records exactly what it holds.
-                    order.reserved_margin = max(Decimal("0"), old_margin + margin_delta)
+                    # The new requirement, not `old + delta`: on a PARTIALLY_FILLED order
+                    # the stored hold has already been reduced proportionally by
+                    # record_deal, so reconstructing it by addition would drift.
+                    order.reserved_margin = max(Decimal("0"), new_margin)
 
             # Persist order
             saved_order = await self.order_repo.save(order)

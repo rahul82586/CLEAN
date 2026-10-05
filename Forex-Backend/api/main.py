@@ -607,9 +607,41 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
             expiration_worker = ExpirationWorker(
                 order_repo=container.resolve(IOrderRepository),
                 event_bus=event_bus,
+                # N13: without this the expiry release has no repository to release
+                # against and only logs a warning, stranding the hold forever.
+                account_repo=container.resolve(IAccountRepository),
             )
             app.state.expiration_worker = expiration_worker
             app.state.expiration_worker_task = asyncio.create_task(expiration_worker.start())
+
+            # 4a3. Reservation sweep (audit N8). `margin_reservation.py` documents this as
+            #      "the M7+ answer" to a node crashing between approval and a terminal
+            #      state, and the worker existed - but nothing started it, so a stranded
+            #      hold still reduced the client's free margin forever. It only ever acts
+            #      on orders already in a TERMINAL state, never on a working one, so it
+            #      cannot free margin a live pending still needs.
+            try:
+                from application.workers.reservation_sweep import ReservationSweep
+
+                reservation_sweep = ReservationSweep(
+                    order_repo=container.resolve(IOrderRepository),
+                    account_repo=container.resolve(IAccountRepository),
+                    sweep_seconds=int(os.environ.get("RESERVATION_SWEEP_SECONDS", "900") or 900),
+                )
+                app.state.reservation_sweep = reservation_sweep
+                app.state.reservation_sweep_task = asyncio.create_task(
+                    reservation_sweep.start()
+                )
+                logger.info(
+                    "\u2705 ReservationSweep started (every %ss)",
+                    reservation_sweep.sweep_seconds,
+                )
+            except Exception as exc:  # noqa: BLE001 - a missing sweep must not stop boot
+                logger.error(
+                    "reservation sweep could not be started: %s. Margin stranded on "
+                    "orders that died between approval and a terminal state will NOT be "
+                    "recovered automatically.", exc,
+                )
 
             # 4b. Price source (M5). A server with no feed cannot price an
             #     order, and refusing is correct - but a dev/test box needs
@@ -717,6 +749,17 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
                 logger.info("ValuationService stopped")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error stopping ValuationService: {e}")
+
+        reservation_sweep = getattr(app.state, "reservation_sweep", None)
+        if reservation_sweep is not None:
+            try:
+                await reservation_sweep.stop()
+                task = getattr(app.state, "reservation_sweep_task", None)
+                if task is not None and not task.done():
+                    task.cancel()
+                logger.info("ReservationSweep stopped")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Error stopping ReservationSweep: {e}")
 
         swap_worker = getattr(app.state, "swap_worker", None)
         if swap_worker is not None:

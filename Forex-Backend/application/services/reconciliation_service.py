@@ -253,8 +253,19 @@ class ValuationService:
             stats["margin_unrepaired"] = stats.get("margin_unrepaired", 0) + 1
         elif positions and account.margin_used.amount <= 0 and self.risk_engine is not None:
             try:
+                # R3 completion: this REPAIRS `margin_used`, so it has to reproduce what
+                # the booking path writes - positions AND working orders. Repairing from
+                # positions alone would overwrite a correct figure with one that omits
+                # every resting pending.
+                from application.services.account_revaluation import (
+                    _open_pendings_for_margin,
+                )
+
                 snapshot = self.risk_engine.calculate_margin_level(
-                    account, await self._as_position_entities(positions))
+                    account,
+                    await self._as_position_entities(positions),
+                    await _open_pendings_for_margin(account.login),
+                )
                 account.margin_used = Money(snapshot.margin_used, currency)
                 account.margin_used = Money(snapshot.margin_used, currency)
                 # R15 consolidation: the SNAPSHOT's own free margin, which the engine

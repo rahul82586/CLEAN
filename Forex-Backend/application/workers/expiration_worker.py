@@ -33,9 +33,17 @@ class ExpirationWorker:
         order_repo: IOrderRepository,
         event_bus: IEventBus,
         sweep_seconds: Optional[int] = None,
+        account_repo: Optional[Any] = None,
     ):
         self.order_repo = order_repo
         self.event_bus = event_bus
+        #: N13: the expiry release reads `getattr(self, "account_repo", None)`, and this
+        #: constructor never set it - so it was ALWAYS None, `release_margin` fell through
+        #: to its "no repository and no account in scope" warning, and every expired
+        #: pending stranded its hold on `accounts.margin_reserved` exactly as before the
+        #: R5 fix. Optional so existing construction sites keep working, but the server
+        #: passes one.
+        self.account_repo = account_repo
         if sweep_seconds is None:
             raw = os.environ.get("EXPIRATION_SWEEP_SECONDS", "").strip()
             try:

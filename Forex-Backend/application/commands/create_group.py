@@ -32,7 +32,8 @@ from core.events.domain_events import GroupCreated
 from core.ports.interfaces import IGroupRepository, IEventBus
 from application.cache.config_cache import get_config_cache
 
-from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
+# N10: the constants live in core.domains.accounts.thresholds;
+# the duplicate import from account.py shadowed the one below.
 from core.domains.accounts.thresholds import (
     DEFAULT_MARGIN_CALL_LEVEL,
     DEFAULT_STOP_OUT_LEVEL,
