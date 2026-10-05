@@ -257,13 +257,73 @@ CFD_LEVERAGE = 4
 FOREX_NO_LEVERAGE = 5
 EXCHANGE_STOCKS = 32
 EXCHANGE_FUTURES = 33
+#: ============================================================================
+#: FORTS (CalcMode 34) IS NOT CORRECT AND IS NOT USABLE ON THIS DEPLOYMENT.
+#:
+#: Two independent reasons, either of which alone is enough:
+#:
+#: 1. WE HAVE NO MOEX CONNECTION. MT5's own documentation is explicit
+#:    (MT5Admin-Doc, Symbols/Symbol-Settings/Trade/Margin-Calculation/Basic.md,
+#:    "Exchange FORTS Futures"):
+#:
+#:      "The Exchange FORTS Futures mode must only be used together with the MOEX
+#:       Derivatives Gateway. Otherwise the margin requirements calculation results
+#:       may be unpredictable."
+#:
+#:    That gateway (MOEXDerivativesGateway, see Platform-Components/Gateways/
+#:    MOEX-Derivatives.md) is a SEPARATE PROCESS which connects to the Moscow Exchange
+#:    and supplies the two inputs FORTS cannot do without: the session SettlementPrice
+#:    (`IMTConSymbol::PriceSettle`, "the clearing price of the previous session") and
+#:    `IMTConSymbol::MarginRateCurrency`, whose SDK note reads "The values are sent by
+#:    the Moscow Exchange when using the gateway MetaTrader 5 to MOEX Derivatives."
+#:    This platform runs none of it - the A-Book adapters are stub / fix / trade_server
+#:    (`infrastructure/gateways/`, selected by BROKER_LP_GATEWAY).
+#:
+#:    Measured on the live 362-symbol server export
+#:    (MT5_Exported_files_reference/Symbols TCTrader-Live.json):
+#:      CalcMode distribution = {4: 245, 5: 54, 0: 45, 2: 18}
+#:      FORTS(34) / Exchange(32,33,35-39) / Collateral(64) symbols = NONE
+#:      PriceSettle present on 362/362 and ZERO on all of them
+#:      MarginRateCurrency present on 0/362 - absent from the wire entirely
+#:    There is nothing here to calculate FORTS margin FOR.
+#:
+#: 2. THE IMPLEMENTATION IS INCOMPLETE EVEN WITH THE DATA. See `_forts_margin` below:
+#:    the Sum(MarginOrder) legs are not modelled, and the order leg for an untriggered
+#:    market or stop order needs the session High/Low, which nothing stores.
+#:
+#: THEREFORE CalcMode 34 is REFUSED at configuration time - see
+#: `_MOEX_GATEWAY_REQUIRED_CALC_MODES` and the guard in
+#: api/routers/admin/skeletons.py::_to_mode_int. Refusing is the safe direction: an
+#: unrefused 34 makes `basic_margin` raise on every order for that symbol, so the symbol
+#: silently becomes untradeable instead of loudly becoming unconfigurable.
+#:
+#: The formula below is kept (a) so the refusal has something to refuse, (b) so the
+#: arithmetic is already right if a MOEX gateway is ever connected, and (c) because
+#: deleting it would lose the only transcription of MT5's published worked example.
+#: ============================================================================
 EXCHANGE_FUTURES_FORTS = 34
+
 EXCHANGE_OPTIONS = 35
 EXCHANGE_OPTIONS_MARGIN = 36
 EXCHANGE_BONDS = 37
 EXCHANGE_STOCKS_MOEX = 38
 EXCHANGE_BONDS_MOEX = 39
 SERV_COLLATERAL = 64
+
+#: CalcModes whose margin inputs are supplied by an EXCHANGE gateway rather than by symbol
+#: configuration, per Basic.md's FORTS warning and Stock-Exchange.md's exchange model.
+#: Configuring one without that gateway produces a margin number that cannot be right, so
+#: the Admin API refuses them (see api/routers/admin/skeletons.py).
+_MOEX_GATEWAY_REQUIRED_CALC_MODES = frozenset({
+    EXCHANGE_STOCKS,             # 32
+    EXCHANGE_FUTURES,            # 33
+    EXCHANGE_FUTURES_FORTS,      # 34
+    EXCHANGE_OPTIONS,            # 35
+    EXCHANGE_OPTIONS_MARGIN,     # 36
+    EXCHANGE_BONDS,              # 37
+    EXCHANGE_STOCKS_MOEX,        # 38
+    EXCHANGE_BONDS_MOEX,         # 39
+})
 
 #: Modes whose formula multiplies by the market price, so a missing price must raise
 #: rather than be assumed to be 1.0.
@@ -304,9 +364,15 @@ def _forts_margin(
     *,
     side: str = "BUY",
 ) -> Decimal:
-    """MT5's FORTS (Moscow Exchange derivatives) margin.
+    """MT5's FORTS (Moscow Exchange derivatives) margin - POSITION LEG ONLY.
 
-    The documented formulas:
+    READ THE BANNER ON `EXCHANGE_FUTURES_FORTS` FIRST. Short version: this deployment has
+    no MOEX Derivatives Gateway, so the two inputs this formula needs (SettlementPrice and
+    MarginRateCurrency) have no source, and CalcMode 34 is refused at configuration time.
+    This function is unreachable in production and is kept correct so that it stays that
+    way if a gateway is ever connected.
+
+    The documented formulas (Basic.md, "Exchange FORTS Futures"):
 
         MarginBuy  = MarginPos(buy)  + Sum(MarginBuyOrder)
         MarginSell = MarginPos(sell) + Sum(MarginSellOrder)
@@ -319,20 +385,34 @@ def _forts_margin(
     position in the Sell formula, negative otherwise. That sign is what gives a trader
     a margin DISCOUNT for holding a position against their pending orders.
 
-    WHAT IS NOT MODELLED, stated rather than silently omitted: the `Sum(MarginOrder)`
-    terms. They need the symbol's live pending-order book (with highest/lowest session
-    prices for untriggered market and stop orders), which stage 1 cannot see - it is
-    handed one operation at a time. So this returns the POSITION margin and the order
-    leg is added by the caller that owns the order book. Per-side `InitialMarginBuy` and
-    `InitialMarginSell` are not carried by our symbol model either; both sides use
-    `margin_initial`, which is MT5's single Margin-tab field.
+    WHERE THE TWO INITIAL MARGINS LIVE (Basic.md:220, verbatim):
+        "InitialMarginBuy is written to the 'Initial margin' field, InitialMarginSell is
+         written to the 'Maintenance Margin' field in symbol properties."
+    So `InitialMarginBuy` is `spec.margin_initial` and `InitialMarginSell` is
+    `spec.margin_maintenance`. An earlier revision of this function claimed the sell-side
+    value was "not carried by our symbol model" and used `margin_initial` for BOTH sides.
+    That was wrong, and it is measurable against MT5's own worked example
+    (InitialMarginBuy 7665.41, InitialMarginSell 7739.59): the sell side came out
+    45043.87 where the documentation gives 45563.13 - 519.26 low - and since MAX() picks
+    the sell side in that example, the final margin was understated by the same amount.
+
+    WHAT IS STILL NOT MODELLED, stated rather than silently omitted:
+      * the `Sum(MarginBuyOrder)` / `Sum(MarginSellOrder)` legs. They need the symbol's live
+        pending-order book, which stage 1 cannot see - it is handed one operation at a time.
+        This returns the POSITION margin only, so it is a LOWER BOUND, never the answer.
+      * the price an untriggered market or stop order is costed at, which Basic.md:204 says
+        is "the Highest and the Lowest price of the contract for the current session".
+        Nothing in this platform stores a per-session high/low.
+    Both are why the banner says the mode is refused rather than half-implemented.
     """
     settlement = getattr(spec, "settlement_price", None)
     if settlement is None:
         raise MarginCalculationError(
-            f"{spec.name}: CalcMode {EXCHANGE_FUTURES_FORTS} (FORTS) needs the settlement "
-            "price from the Futures tab. Without it the position margin cannot be "
-            "computed and the result would be arbitrary."
+            f"{spec.name}: CalcMode {EXCHANGE_FUTURES_FORTS} (FORTS) needs the session "
+            "settlement (clearing) price, which only the MOEX Derivatives Gateway supplies. "
+            "This deployment has no MOEX connection, so CalcMode 34 is refused at "
+            "configuration time and this symbol should not exist - see the banner on "
+            "EXCHANGE_FUTS_FORTS in this module."
         )
     if price is None or price <= ZERO:
         raise MarginCalculationError(
@@ -342,15 +422,22 @@ def _forts_margin(
     settlement = _dec(settlement)
     rate = ONE + Decimal("0.01") * _dec(getattr(spec, "margin_currency_rate", 0))
     per_point = _tick_ratio(spec) * rate
-    initial = _dec(spec.margin_initial if spec.margin_initial is not None else ZERO)
+
+    # InitialMarginBuy -> the "Initial margin" field; InitialMarginSell -> the
+    # "Maintenance Margin" field. Basic.md:220. Using margin_initial for both understated
+    # MT5's own worked example by 519.26.
+    initial_buy = _dec(spec.margin_initial if spec.margin_initial is not None else ZERO)
+    initial_sell = _dec(
+        spec.margin_maintenance if spec.margin_maintenance is not None else initial_buy
+    )
 
     is_long = str(side).upper() in ("BUY", "LONG")
     # Signed volume, per the doc: + for long in the Buy formula, - for short there.
     buy_volume = volume_lots if is_long else -volume_lots
     sell_volume = -volume_lots if is_long else volume_lots
 
-    margin_buy = buy_volume * (initial + (price - settlement) * per_point)
-    margin_sell = sell_volume * (initial + (settlement - price) * per_point)
+    margin_buy = buy_volume * (initial_buy + (price - settlement) * per_point)
+    margin_sell = sell_volume * (initial_sell + (settlement - price) * per_point)
 
     return max(margin_buy, margin_sell)
 

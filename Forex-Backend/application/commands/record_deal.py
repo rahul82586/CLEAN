@@ -160,15 +160,53 @@ class RecordDealHandler:
         self.uow_factory = uow_factory
 
     async def execute(self, command: RecordDealCommand) -> Deal:
+        """Record one fill: order state, immutable Deal, position, account margin.
+
+        C11: when a unit of work is wired this is ONE transaction. `UnitOfWork.__aexit__`
+        commits on success and rolls back on any exception, so a crash can no longer leave
+        an order FILLED with no deal, or a deal with no position, or a position with no
+        margin update - which is what five or six independent commits allowed.
+
+        C11a: events are published AFTER the commit, not inside it. The in-process bus
+        awaits its handlers inline, and a handler such as `ConfigCache._on_positions_changed`
+        opens its OWN session; published inside the transaction it would read a database
+        that has not committed yet and cache a stale position list. With the Redis bus the
+        problem is worse - the message leaves the process before the rows exist, so a
+        consumer on another node reads nothing at all.
+        """
         logger.info(f"Recording Deal for Order {command.order_id}, Volume {command.volume}")
+
+        pending_events: List[Any] = []
 
         if self.uow_factory:
             async with self.uow_factory() as uow:
-                return await self._execute_internal(command, uow=uow)
+                deal = await self._execute_internal(
+                    command, uow=uow, pending_events=pending_events
+                )
         else:
-            return await self._execute_internal(command)
+            deal = await self._execute_internal(command, pending_events=pending_events)
 
-    async def _execute_internal(self, command: RecordDealCommand, uow: Optional[Any] = None) -> Deal:
+        # Committed (or, without a UoW, each repository call has committed itself).
+        for event in pending_events:
+            try:
+                await self.event_bus.publish(event)
+            except Exception as exc:  # noqa: BLE001
+                # The deal IS booked; a lost notification must not roll it back or raise
+                # into the fill path. Loud, because a subscriber that never hears about a
+                # deal leaves its cache stale.
+                logger.error(
+                    "deal %s is committed but its DealCreated event could not be "
+                    "published: %s - subscribers will hold a stale view of this account",
+                    deal.deal_id, exc,
+                )
+        return deal
+
+    async def _execute_internal(
+        self,
+        command: RecordDealCommand,
+        uow: Optional[Any] = None,
+        pending_events: Optional[List[Any]] = None,
+    ) -> Deal:
         session = uow.session if uow else None
         order_repo = uow.orders if uow and hasattr(uow, 'orders') else self.order_repo
         deal_repo = uow.deals if uow and hasattr(uow, 'deals') else self.deal_repo
@@ -263,7 +301,10 @@ class RecordDealHandler:
         else:
             await account_repo.save(account)
 
-        # 6. Publish Event
+        # 6. Build the event. Published by `execute()` AFTER the transaction commits -
+        # see C11a there. When called without a `pending_events` list (a direct call from
+        # a test or a legacy caller) it is published here, which preserves the old
+        # behaviour exactly for anything not running inside a unit of work.
         event = DealCreated(
             aggregate_id=deal.deal_id,
             payload={
@@ -278,8 +319,12 @@ class RecordDealHandler:
                 "profit": str(deal.profit.amount)
             }
         )
-        await self.event_bus.publish(event)
-        logger.info(f"Deal {deal.deal_id} recorded and event published")
+        if pending_events is not None:
+            pending_events.append(event)
+            logger.info(f"Deal {deal.deal_id} recorded; event queued for post-commit publish")
+        else:
+            await self.event_bus.publish(event)
+            logger.info(f"Deal {deal.deal_id} recorded and event published")
 
         return deal
 

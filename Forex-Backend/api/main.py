@@ -418,11 +418,42 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
                     "be hedged externally", _default_destination.value,
                 )
 
+            # C11: `uow_factory` is deliberately NOT passed, and this is a known open
+            # defect rather than an oversight.
+            #
+            # The plumbing is complete - `setup_persistence_di` defines and registers it
+            # (infrastructure/persistence/di_setup.py:60-64,82), `build_trading_stack`
+            # accepts and forwards it (:202,:396,:413), `RecordDealHandler.execute` uses it
+            # (:165), and `create_account` already refuses a deposit without it. Passing it
+            # here is one line. It is NOT passed because doing it breaks fills:
+            #
+            #   tests/integration/test_c11_transaction.py (xfail) proves that with a UoW the
+            #   order stays PLACED and NO deal and NO position row is written, while the
+            #   account row IS updated. Instrumenting UnitOfWork.commit shows why: the unit
+            #   of work's session identity map contains ONLY AccountModel - the order, deal
+            #   and position merges never reach that session, so its commit has nothing to
+            #   flush for them. `execute()` still returns a Deal and still publishes
+            #   DealCreated, so the failure is silent.
+            #
+            # That path has never run in production, which is why nobody hit it. Enabling it
+            # needs its own change: find where the three merges are being routed, fix it, and
+            # turn the xfail test into a passing one FIRST.
+            #
+            # Consequence of leaving it off, stated plainly: a fill is five or six
+            # independent commits, so a crash between them can leave an order FILLED with no
+            # deal behind it, or a deal with no position, or a position with no margin update.
             stack = await build_trading_stack(
                 container,
                 market_data_engine=market_data_engine,
                 config_cache=cache,
                 default_destination=_default_destination,
+            )
+            logger.warning(
+                "C11 OPEN: no unit of work around a fill - order, deal, position and "
+                "account are written as separate commits, so a crash between them leaves "
+                "torn state. Passing uow_factory is NOT the fix: the UoW path currently "
+                "persists only the account row (see "
+                "tests/integration/test_c11_transaction.py)."
             )
             register_di_providers(stack.as_providers())
             register_di_providers({"market_data_engine": stack.market_data_engine})

@@ -12,7 +12,12 @@ from core.ports.interfaces import (
     IIPWhitelist,
     ITokenBlacklist,
 )
-from api.auth.jwt_handler import create_access_token
+# R23: was . That was the ONE
+# non-lazy edge of the application -> api dependency cycle, and it inverted the rule that an
+# application service must not depend on an adapter. The module moved to
+# infrastructure/security (it imports only os/datetime/typing/jwt); api/auth/jwt_handler.py
+# is now a re-export shim for the existing HTTP-layer importers.
+from infrastructure.security.jwt_handler import create_access_token
 
 
 class AuthService:

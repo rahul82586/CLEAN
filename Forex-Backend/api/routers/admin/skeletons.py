@@ -29,6 +29,7 @@ from typing import Any, Dict, List
 from api.auth.admin_dependencies import require_right
 import json
 import logging
+import os
 
 logger = logging.getLogger(__name__)
 from decimal import Decimal
@@ -109,12 +110,98 @@ symbols_skeleton = APIRouter(
 
 
 def _to_mode_int(val: Any, default: int, mapping: Dict[str, int]) -> int:
+    """Coerce a mode value to its MT5 integer, REFUSING anything illegal.
+
+    Two silent failures are closed here (audit M18):
+
+    * an unknown LABEL returned `default`, so a dropdown value the map did not cover
+      answered HTTP 200 and stored nothing - the operator saw a save that did not happen;
+    * an INTEGER was returned unchecked (`if isinstance(val, int): return val`), so any
+      number could be written to `calc_mode`. Combined with `basic_margin` raising on an
+      unrecognised CalcMode, that turned one bad PUT into a symbol that rejects every
+      order, permanently, with no way to see why from the UI.
+    """
+    legal = set(mapping.values())
+    if isinstance(val, bool):            # bool is an int subclass; never a mode
+        val = int(val)
     if isinstance(val, int):
+        if val not in legal:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"{val} is not a valid value for this field. Legal MT5 values: "
+                    f"{sorted(legal)}."
+                ),
+            )
         return val
     if isinstance(val, str):
         val_upper = val.upper().replace(" ", "_").replace("-", "_")
-        return mapping.get(val_upper, default)
+        if val_upper not in mapping:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    f"{val!r} is not a recognised value for this field. Accepted names: "
+                    f"{sorted(set(mapping))[:40]}."
+                ),
+            )
+        return mapping[val_upper]
     return default
+
+
+#: Set to "1" only on a server that actually runs the MOEX Derivatives Gateway.
+_MOEX_OPT_IN_ENV = "BROKER_ALLOW_EXCHANGE_CALC_MODES"
+
+
+def _reject_unsupported_calc_mode(mode: int) -> None:
+    """Refuse the exchange calculation modes this deployment cannot support.
+
+    MT5, Basic.md ("Exchange FORTS Futures"), verbatim:
+
+        "The Exchange FORTS Futures mode must only be used together with the MOEX
+         Derivatives Gateway. Otherwise the margin requirements calculation results
+         may be unpredictable."
+
+    That gateway is a separate process which supplies the session SettlementPrice
+    (`IMTConSymbol::PriceSettle`) and `IMTConSymbol::MarginRateCurrency` - the SDK note for
+    the latter says its values "are sent by the Moscow Exchange when using the gateway
+    MetaTrader 5 to MOEX Derivatives". This platform has no such adapter: the A-Book
+    gateways are stub / fix / trade_server.
+
+    Measured on the live 362-symbol export: CalcMode is only ever 0, 2, 4 or 5 - there is
+    not one exchange or FORTS symbol - and `PriceSettle` is present on all 362 and zero on
+    all 362, while `MarginRateCurrency` is absent from the wire entirely.
+
+    Refusing at configuration time is the safe direction. Storing 34 anyway would make
+    `basic_margin` raise on every order for that symbol, so the symbol would become
+    untradeable with nothing in the UI to explain it. See the banner on
+    `EXCHANGE_FUTURES_FORTS` in core/domains/market_data/margin.py.
+    """
+    from core.domains.market_data.margin import (
+        _MOEX_GATEWAY_REQUIRED_CALC_MODES as _EXCHANGE_MODES,
+    )
+
+    if mode not in _EXCHANGE_MODES:
+        return
+    if os.environ.get(_MOEX_OPT_IN_ENV, "").strip().lower() in ("1", "true", "yes"):
+        logger.warning(
+            "CalcMode %s accepted because %s is set. This deployment has no MOEX "
+            "Derivatives Gateway in the codebase, so the margin for this symbol will be "
+            "computed without a session settlement price and must be treated as "
+            "untrustworthy.", mode, _MOEX_OPT_IN_ENV,
+        )
+        return
+    raise HTTPException(
+        status_code=status.HTTP_400_BAD_REQUEST,
+        detail=(
+            f"CalcMode {mode} is an exchange calculation mode (stocks / futures / FORTS / "
+            f"options / bonds). MT5 requires the MOEX Derivatives Gateway for these, "
+            f"because the session settlement price and the margin currency rate come from "
+            f"the exchange - and this server has no MOEX connection, so the margin cannot "
+            f"be calculated correctly. Legal modes here: 0 Forex, 1 Futures, 2 CFD, "
+            f"3 CFD Index, 4 CFD Leverage, 5 Forex No Leverage, 64 Collateral. Set "
+            f"{_MOEX_OPT_IN_ENV}=1 only on a server that really runs that gateway."
+        ),
+    )
 
 
 def _calc_mode_map() -> Dict[str, int]:
@@ -253,6 +340,7 @@ async def create_symbol(
     exec_mode_val = settings_dict.get("exec_mode", body.get("exec_mode", 2))
 
     calc_mode = _to_mode_int(calc_mode_val, 0, _CALC_MODES)
+    _reject_unsupported_calc_mode(calc_mode)
     trade_mode = _to_mode_int(trade_mode_val, 4, _TRADE_MODES)
     exec_mode = _to_mode_int(exec_mode_val, 2, _EXEC_MODES)
 
@@ -820,7 +908,9 @@ async def update_symbol(
     if _calc_raw is not None:
         # The dropdown sends the human LABEL ("CFD", "Forex No Leverage"), which
         # _to_mode_int normalises. It also accepts the integer.
-        model.calc_mode = _to_mode_int(_calc_raw, model.calc_mode, _CALC_MODES)
+        _new_calc_mode = _to_mode_int(_calc_raw, model.calc_mode, _CALC_MODES)
+        _reject_unsupported_calc_mode(_new_calc_mode)
+        model.calc_mode = _new_calc_mode
 
     _trade_raw = _first_present((body, settings_dict), ("trade_mode",))
     if _trade_raw is not None:
