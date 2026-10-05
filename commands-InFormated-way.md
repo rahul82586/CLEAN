@@ -240,3 +240,14 @@ GET  /api/v1/manager/OrderDelete
  > **Note:** The endpoint methods shown in this quick reference are based on the commands above; use the Swagger documentation as the authoritative API definition.
 
 ---
+
+---
+
+ # 14\. Command to remove all __pycache__ and .pytest_cache folders recursively inside the project:
+
+ ```
+ Get-ChildItem "D:\glm crawl\project-folder-for-claw\CLEAN\Forex-Backend" -Directory -Recurse -Force |
+Where-Object { $_.Name -in "__pycache__", ".pytest_cache" } |
+Remove-Item -Recurse -Force
+
+ ```
