@@ -622,6 +622,7 @@ def calculate_account_margin(
     rate_lookup: Any,
     leverage: int = 100,
     maintenance: bool = False,
+    tier_rates: Optional[Dict[str, tuple]] = None,
 ) -> MarginBreakdown:
     """MT5 stage 4, and the entry point the risk engine should call.
 
@@ -632,6 +633,14 @@ def calculate_account_margin(
 
     Pending orders are always costed at the INITIAL rate regardless of ``maintenance``,
     per MT5: "For pending orders, the initial margin is always checked."
+
+    ``tier_rates`` carries MT5's floating-leverage coefficient per symbol, as
+    ``{symbol: (initial_rate, maintenance_rate)}``. MT5 describes it as "an ADDITIONAL
+    COEFFICIENT to the initial and maintenance margin values calculated in accordance with
+    the symbol settings", so it multiplies the per-symbol total produced here rather than
+    replacing any formula. Applying it in THIS function - and nowhere else - is what stops
+    the snapshot, the booked ``margin_used`` and the pre-trade gate from disagreeing about
+    whether tiers exist (audit N5). An empty/absent mapping is bit-for-bit the old behaviour.
     """
     breakdown = MarginBreakdown(deposit_currency=deposit_currency)
     by_symbol: Dict[str, List[Leg]] = {}
@@ -664,34 +673,97 @@ def calculate_account_margin(
         # `symbol_total` is set and the existing tail of the loop stores it, so the
         # per-symbol accounting stays identical to the Basic path.
         if spec.hedged_use_larger_leg:
-            side_totals = {}
+            # MT5 documents this as a SEPARATE method: "the longer leg PLUS the long
+            # pending orders" against "the shorter leg PLUS the short pending orders", and
+            # "the largest one of all calculated values is used as the final margin".
+            #
+            # Two defects fixed here (audit C8):
+            #   * the side filter matched only "BUY"/"SELL", so the six PENDING operation
+            #     types never entered either side, and the `continue` below then skipped the
+            #     pending loop as well - a resting pending on the larger side charged
+            #     NOTHING. Measured: BUY 1.0 + BUY_LIMIT 0.5 returned 1000 where MT5 gives
+            #     1500.
+            #   * `maintenance` was hardcoded False, so a stop-out computed on this branch
+            #     used INITIAL margin while every other path used maintenance.
+            #
+            # Positions are costed at `maintenance` (as passed); pendings are ALWAYS initial,
+            # per "For pending orders, the initial margin is always checked."
+            side_totals: Dict[str, Decimal] = {}
+            side_pending: Dict[str, Decimal] = {}
             for side_name in ("BUY", "SELL"):
-                side_legs = [leg for leg in symbol_legs if leg.operation == side_name]
+                side_positions = [
+                    leg for leg in positions
+                    if leg.operation == side_name
+                ]
+                side_pendings = [
+                    leg for leg in pendings
+                    if str(leg.operation).upper().startswith(side_name)
+                ]
+
+                side_total = ZERO
                 side_volume, side_price = _weighted_average(
-                    [(leg.volume, leg.price) for leg in side_legs]
+                    [(leg.volume, leg.price) for leg in side_positions]
                 )
-                if side_volume <= ZERO:
-                    continue
-                side_converted = convert_to_deposit(
-                    basic_margin(
+                if side_volume > ZERO:
+                    side_total += apply_rate(
+                        convert_to_deposit(
+                            basic_margin(
+                                spec,
+                                side_volume,
+                                side_price,
+                                leverage=leverage,
+                                maintenance=maintenance,
+                            ),
+                            margin_currency=spec.margin_currency,
+                            deposit_currency=deposit_currency,
+                            side=side_name,
+                            rate_lookup=rate_lookup,
+                        ),
                         spec,
-                        side_volume,
-                        side_price,
-                        leverage=leverage,
-                        maintenance=False,
-                    ),
-                    margin_currency=spec.margin_currency,
-                    deposit_currency=deposit_currency,
-                    side=side_name,
-                    rate_lookup=rate_lookup,
-                )
-                side_totals[side_name] = apply_rate(
-                    side_converted, spec, side_name, False
-                )
+                        side_name,
+                        maintenance,
+                    )
+
+                pending_part = ZERO
+                for leg in side_pendings:
+                    pending_part += apply_rate(
+                        convert_to_deposit(
+                            basic_margin(
+                                spec,
+                                leg.volume,
+                                leg.price,
+                                leverage=leverage,
+                                maintenance=False,
+                            ),
+                            margin_currency=spec.margin_currency,
+                            deposit_currency=deposit_currency,
+                            side=side_name,
+                            rate_lookup=rate_lookup,
+                        ),
+                        spec,
+                        leg.operation,
+                        False,
+                    )
+                if pending_part > ZERO:
+                    side_pending[side_name] = pending_part
+                side_total += pending_part
+
+                if side_total > ZERO:
+                    side_totals[side_name] = side_total
 
             if side_totals:
                 # "The largest one of all calculated values is used as the final margin."
-                symbol_total = max(side_totals.values())
+                winning = max(side_totals, key=lambda k: side_totals[k])
+                symbol_total = _apply_tier(
+                    side_totals[winning], tier_rates, symbol, maintenance
+                )
+                # Recorded for observability. NOTE: in THIS method the pending figure is a
+                # COMPONENT of per_symbol (it is already inside the winning side's total),
+                # not an amount to be added to it - unlike the Basic path below.
+                if winning in side_pending:
+                    breakdown.pending[symbol] = _apply_tier(
+                        side_pending[winning], tier_rates, symbol, maintenance
+                    )
                 breakdown.per_symbol[symbol] = symbol_total
                 breakdown.total += symbol_total
                 continue
@@ -737,11 +809,22 @@ def calculate_account_margin(
             if spec.margin_initial is not None and spec.margin_initial > ZERO:
                 hedged_basic = covered_volume * spec.margin_hedged
             else:
+                # EVERY input the symbol's own formula reads must be carried over.
+                # `contract_size` is replaced by MarginHedged (that is the definition of
+                # the setting), but calc_mode alone is not enough: dropping tick_value /
+                # tick_size made CFD-Index covered volume raise "Tick size is 0", dropping
+                # face_value made bonds raise, and dropping the fixed margins changed the
+                # branch taken. Audit C7: a STOCKS symbol measured 500 where MT5 gives 5000.
                 hedged_spec = SymbolMarginSpec(
                     name=spec.name,
                     contract_size=spec.margin_hedged,
                     calc_mode=spec.calc_mode,
                     margin_currency=spec.margin_currency,
+                    margin_initial=spec.margin_initial,
+                    margin_maintenance=spec.margin_maintenance,
+                    tick_value=spec.tick_value,
+                    tick_size=spec.tick_size,
+                    face_value=spec.face_value,
                     rates=spec.rates,
                 )
                 hedged_basic = basic_margin(
@@ -784,11 +867,43 @@ def calculate_account_margin(
             breakdown.pending[symbol] = pending_total
             symbol_total += pending_total
 
+        symbol_total = _apply_tier(symbol_total, tier_rates, symbol, maintenance)
         if symbol_total > ZERO:
             breakdown.per_symbol[symbol] = symbol_total
         breakdown.total += symbol_total
 
     return breakdown
+
+
+def _apply_tier(
+    amount: Decimal,
+    tier_rates: Optional[Dict[str, tuple]],
+    symbol: str,
+    maintenance: bool,
+) -> Decimal:
+    """Multiply one symbol's margin by its floating-leverage coefficient.
+
+    Returns ``amount`` unchanged when no tier applies, so a group without a profile is
+    unaffected. The coefficient is read per SYMBOL: MT5's `Volume per symbol` and
+    `Notional value per symbol` ranges measure one instrument, so one account-wide
+    coefficient would be wrong for a multi-symbol book (audit N6).
+    """
+    if not tier_rates or amount == ZERO:
+        return amount
+    rates = tier_rates.get(symbol)
+    if not rates:
+        return amount
+    try:
+        initial_rate, maintenance_rate = rates
+    except (TypeError, ValueError):
+        return amount
+    rate = maintenance_rate if maintenance else initial_rate
+    rate = _dec(rate)
+    if rate <= ZERO:
+        # MT5: for leverage tiers a zero ratio means NO MARGIN IS CHARGED (unlike symbol
+        # settings, where a zero maintenance rate means "inherit the initial one").
+        return ZERO
+    return amount * rate
 
 
 # ---------------------------------------------------------------------------

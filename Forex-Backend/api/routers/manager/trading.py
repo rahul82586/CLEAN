@@ -166,7 +166,15 @@ async def recalculate_account_trading_state(
 
         currency = acc.currency
 
-        if not open_positions:
+        # R3 completion: an account holding ONLY working orders still owes margin. This
+        # branch used to test `open_positions` alone, so a dealer action on an account with
+        # no positions but three resting pendings wrote margin_used = 0 and pinned
+        # margin_level at the 999999 sentinel - from which stop-out can never fire.
+        from application.services.account_revaluation import _open_pendings_for_margin
+
+        open_pendings = await _open_pendings_for_margin(acc_login)
+
+        if not open_positions and not open_pendings:
             acc.margin_used = Money(Decimal("0.00"), currency)
             acc.profit = Money(Decimal("0.00"), currency)
             acc.equity = Money(acc.balance.amount + acc.credit.amount, currency)
@@ -177,7 +185,9 @@ async def recalculate_account_trading_state(
 
         if risk_engine is not None:
             try:
-                snapshot = risk_engine.calculate_margin_level(acc, open_positions)
+                snapshot = risk_engine.calculate_margin_level(
+                    acc, open_positions, open_pendings
+                )
                 acc.margin_used = Money(snapshot.margin_used, currency)
                 acc.equity = Money(snapshot.equity, currency)
                 acc.profit = Money(snapshot.equity - (acc.balance.amount + acc.credit.amount), currency)

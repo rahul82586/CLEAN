@@ -15,8 +15,8 @@ from dataclasses import dataclass
 from core.domains.accounts.account import Account
 from core.domains.oms.entities.position import Position
 from core.domains.common.value_objects import Money, Price
+from core.domains.market_data.margin import margin_level as compute_margin_level
 
-from core.domains.accounts.account import (DEFAULT_MARGIN_CALL_LEVEL, DEFAULT_STOP_OUT_LEVEL)
 from core.domains.accounts.thresholds import (
     DEFAULT_MARGIN_CALL_LEVEL,
     DEFAULT_STOP_OUT_LEVEL,
@@ -59,6 +59,47 @@ class LiquidationService:
         #: primitive `calculate_margin_level` uses. Optional so every existing caller and
         #: test double keeps working.
         self.risk_engine = risk_engine
+
+    def _projected_margin(
+        self, account, all_positions, already_selected, previous: Decimal
+    ) -> Decimal:
+        """The maintenance margin still required once `already_selected` are gone.
+
+        Recomputed through the RiskEngine over the REMAINING positions, so the plan sizes
+        itself with the same number the booked `margin_used`, the stop-out trigger and the
+        selection loop all use - including CalcMode, currency conversion, netting/hedging
+        aggregation and the floating-leverage coefficient.
+
+        The previous version subtracted `account.margin_used / len(positions)`, a flat
+        average that read neither the position nor how many were already selected (audit
+        N2). With one large position holding most of the margin it freed 1/N of the total,
+        so the loop kept closing positions the client did not need to lose; with the
+        distribution reversed it stopped early and left the account below stop-out.
+
+        Falls back to the flat average ONLY when no engine is wired, and says so, because an
+        approximation that does not announce itself is how the original defect survived.
+        """
+        remaining = [p for p in all_positions if p not in already_selected]
+        engine = self.risk_engine
+        helper = getattr(engine, "maintenance_margin", None)
+        if helper is not None and remaining:
+            try:
+                return max(Decimal("0"), Decimal(str(helper(account, remaining))))
+            except Exception as exc:  # noqa: BLE001
+                logger.error(
+                    "liquidation plan could not recompute maintenance margin (%s); "
+                    "falling back to a flat per-position share, which may close too many "
+                    "or too few positions", exc,
+                )
+        elif helper is not None and not remaining:
+            # Everything is selected: nothing is left to hold margin.
+            return Decimal("0")
+        else:
+            logger.warning(
+                "liquidation plan has no risk engine; approximating the released margin as "
+                "an equal share per position - the plan may mis-size the closure"
+            )
+        return self._margin_freed_for(None, account, all_positions, already_selected)
 
     def _margin_freed_for(
         self, position, account, all_positions, already_selected
@@ -229,15 +270,19 @@ class LiquidationService:
             )
 
         total_floating_pnl = sum(pnl.amount for _, pnl in valued)
-        current_equity = account.balance.amount + total_floating_pnl
+        # N3: broker CREDIT is part of equity. `RiskEngine.calculate_margin_level` and
+        # `Account.update_equity` both add it; this planner did not, so an account trading
+        # on credit was valued poorer than it is and the plan force-closed MORE positions
+        # than the level actually required.
+        credit = getattr(getattr(account, "credit", None), "amount", Decimal("0")) or Decimal("0")
+        current_equity = account.balance.amount + credit + total_floating_pnl
         projected_margin_used = account.margin_used.amount
         
         for position, pnl in valued:
             # Check if current margin level is above stop_out
-            if projected_margin_used > Decimal('0'):
-                projected_margin_level = (current_equity / projected_margin_used) * Decimal('100')
-            else:
-                projected_margin_level = Decimal('999999')
+            projected_margin_level = compute_margin_level(
+                current_equity, projected_margin_used
+            )
             
             # If margin level is above stop_out, we're done
             if projected_margin_level >= stop_out_level:
@@ -253,14 +298,14 @@ class LiquidationService:
             # conversion - wrong for Forex, which must divide by leverage, and wrong for
             # every CFD mode. Releasing a share of the account's REAL booked `margin_used`
             # keeps this simulation consistent with the number the stop-out decision reads.
-            margin_freed = self._margin_freed_for(position, account, open_positions, positions_to_close)
-            projected_margin_used = max(Decimal('0'), projected_margin_used - margin_freed)
+            projected_margin_used = self._projected_margin(
+                account, open_positions, positions_to_close, projected_margin_used
+            )
         
         # Calculate final projected margin level
-        if projected_margin_used > Decimal('0'):
-            final_margin_level = (current_equity / projected_margin_used) * Decimal('100')
-        else:
-            final_margin_level = Decimal('999999')
+        # R15/C2: the shared function, which returns MARGIN_LEVEL_UNLIMITED for a zero
+        # requirement instead of a literal 999999 written out a fourth time.
+        final_margin_level = compute_margin_level(current_equity, projected_margin_used)
         
         is_fully_liquidated = len(positions_to_close) == len(open_positions)
         

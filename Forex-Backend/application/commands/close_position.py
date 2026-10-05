@@ -225,7 +225,22 @@ class ClosePositionHandler:
         # --- margin: recomputed over the still-open positions only.
         if self.risk_engine is not None:
             try:
-                snapshot = self.risk_engine.calculate_margin_level(account, open_positions)
+                # R3 completion: this recomputes and WRITES `margin_used`, so it must see
+                # the account's working orders. Passing positions alone meant closing one
+                # position silently removed every resting pending from `margin_used` - the
+                # figure `record_deal` had just written WITH them - which lifted
+                # `margin_level` and pushed stop-out further away.
+                # Imported lazily: account_revaluation reaches api.di_providers, and a
+                # module-level import here would add an edge to the existing cycle.
+                from application.services.account_revaluation import (
+                    _open_pendings_for_margin,
+                )
+
+                snapshot = self.risk_engine.calculate_margin_level(
+                    account,
+                    open_positions,
+                    await _open_pendings_for_margin(account.login),
+                )
                 account.margin_used = Money(snapshot.margin_used, currency)
                 account.margin_free = Money(
                     max(Decimal("0"), account.equity.amount - snapshot.margin_used), currency)

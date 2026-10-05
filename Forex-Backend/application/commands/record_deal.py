@@ -195,7 +195,28 @@ class RecordDealHandler:
         else:
             await order_repo.save(order)
 
-        # 2. Create Immutable Deal Entity
+        # 2. Fetch the account BEFORE building the Deal.
+        #
+        # The Deal's three money fields used to be constructed as `Money(..., "USD")`
+        # unconditionally, and step 5 below does `account.balance + deal.commission`.
+        # `Money.__add__` raises on a currency mismatch, so on ANY account whose currency
+        # is not USD a fill with a non-zero commission died half-way through: the order was
+        # already saved FILLED and the position already created, but the commission was
+        # never charged, `margin_used` was never recomputed and `DealCreated` was never
+        # published. Measured on a EUR account with commission 7:
+        #   ValueError: Cannot add money with different currencies
+        #
+        # The amounts arriving on the command are already in the account's deposit currency
+        # (the orchestrator's `_commission_for` reads the group's rules, and
+        # `close_position` passes a RiskEngine-converted realised PnL - it already builds
+        # `Money(realized_pnl, account.currency)`), so labelling them with the account's
+        # currency is the correct and consistent reading.
+        account = await account_repo.find_by_login(command.account_login, session=session) if hasattr(account_repo, 'find_by_login') and _accepts_session(account_repo.find_by_login) else await account_repo.find_by_login(command.account_login)
+        if not account:
+            raise ValueError(f"Account {command.account_login} not found")
+        deal_currency = getattr(account, "currency", None) or "USD"
+
+        # 3. Create Immutable Deal Entity
         deal_id = str(uuid.uuid4())
         deal = Deal(
             deal_id=deal_id,
@@ -205,9 +226,9 @@ class RecordDealHandler:
             deal_type=command.deal_type,
             volume=volume_obj,
             price=price_obj,
-            commission=Money(Decimal(str(command.commission_amount)), "USD"),
-            swap=Money(Decimal(str(command.swap_amount)), "USD"),
-            profit=Money(Decimal(str(command.profit)), "USD"),
+            commission=Money(Decimal(str(command.commission_amount)), deal_currency),
+            swap=Money(Decimal(str(command.swap_amount)), deal_currency),
+            profit=Money(Decimal(str(command.profit)), deal_currency),
             created_at=datetime.now(timezone.utc)
         )
 
@@ -218,12 +239,7 @@ class RecordDealHandler:
             else:
                 await deal_repo.save(deal)
 
-        # 3. Fetch Account
-        account = await account_repo.find_by_login(command.account_login, session=session) if hasattr(account_repo, 'find_by_login') and _accepts_session(account_repo.find_by_login) else await account_repo.find_by_login(command.account_login)
-        if not account:
-            raise ValueError(f"Account {command.account_login} not found")
-
-        # 4. Apply Deal to Position(s)
+        # 4. Apply Deal to Position(s)  (the account was fetched in step 2 above)
         await self._apply_deal_to_positions(account, deal, order=order, position_repo=position_repo, session=session)
 
         # 5. Update Account Balance AND Margin

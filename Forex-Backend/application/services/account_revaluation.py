@@ -7,6 +7,14 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional
 import logging
 
+# N12: `_MARGIN_LEVEL_UNLIMITED` was referenced below but never defined or imported here -
+# the same class of patch-script defect as the missing `ZERO` in the risk engine (N1). It
+# raised NameError for EVERY account with no open positions, which is the common case, so
+# `compute_trading_state` and the admin revalue endpoint crashed on a flat account. Import
+# the real constant from the one place it is defined.
+from core.domains.accounts.account import MARGIN_LEVEL_UNLIMITED
+from core.domains.market_data.margin import margin_level as compute_margin_level
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,7 +127,10 @@ def compute_trading_state(
             "margin_free": str(equity_amt),
             # R15: a flat account is UNLIMITED, not exhausted. 0 is below every stop-out
           # threshold and would read as a stop-out candidate.
-          "margin_level": str(_MARGIN_LEVEL_UNLIMITED),
+            # R15/N12: the shared function, which returns MARGIN_LEVEL_UNLIMITED for a
+            # zero requirement. This used to be the literal "0.00", which reads as "fully
+            # exhausted" and sits below every stop-out threshold.
+            "margin_level": str(compute_margin_level(equity_amt, Decimal("0.00"))),
             "currency": currency,
         }
 

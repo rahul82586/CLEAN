@@ -885,6 +885,34 @@ class PreTradeRiskService:
         currency, the operation's rate multiplier, and aggregation - through
         core.domains.market_data.margin, which is where the formulas and MT5's own
         published worked examples are asserted. Nothing here re-derives a formula.
+
+        Split in two (audit N4): `initial_requirement` answers "how much does this order
+        need", `_available_margin_check` answers "can the account afford it". Order-lifecycle
+        commands need the first without the second, and previously had no way to ask for it -
+        which is why `modify_order` grew its own formula.
+        """
+        required = await self.initial_requirement(order, account, symbol, price)
+        if required is None:
+            return None
+        return await self._available_margin_check(order, account, required)
+
+    async def initial_requirement(
+        self,
+        order: Order,
+        account: Account,
+        symbol: Symbol,
+        price: Price,
+    ) -> Optional[Decimal]:
+        """MT5 stages 1-3 for ONE order: how much margin it needs. No availability check.
+
+        Public because the order-lifecycle commands must ASK the RMS for this number rather
+        than re-derive it. `modify_order` previously computed
+        `(price * volume * contract_size) / 100` and then scaled the existing reservation by
+        the price ratio - wrong for Forex and Forex-no-leverage, whose margin has NO price
+        term at all (audit N4: a 1.10 -> 1.20 modify moved a 1000 hold to 1090.91 where MT5
+        leaves it at 1000). 99 of the 362 symbols in the live export use those two modes.
+
+        Returns None when the requirement cannot be computed; callers treat that as a refusal.
         """
         from core.domains.market_data.margin import (
             MarginCalculationError,
@@ -892,7 +920,6 @@ class PreTradeRiskService:
             apply_rate,
             basic_margin,
             convert_to_deposit,
-            available_margin,
         )
 
         order_type = order.order_type.value if hasattr(order.order_type, "value") else str(order.order_type)
@@ -928,6 +955,12 @@ class PreTradeRiskService:
                 rate_lookup=self._rate_lookup,
             )
             required = apply_rate(converted, spec, operation, maintenance=False)
+
+            # N5: MT5 floating leverage is "an ADDITIONAL COEFFICIENT to the initial ...
+            # margin values calculated in accordance with the symbol settings". The booked
+            # margin applies it through RiskEngine; if the gate did not, the two would
+            # disagree in exactly the way the two leverage resolvers did (R1).
+            required = required * await self._initial_tier_rate(account, symbol.name)
         except MarginCalculationError as exc:
             # A margin requirement we cannot compute is a rejection, not an approval.
             # The previous code caught every exception here and fell back to a stored
@@ -937,11 +970,85 @@ class PreTradeRiskService:
             )
             return None
 
-        # 4. Available margin. Use the live snapshot when we can build one, and treat a
-        #    failure to build it as a rejection rather than silently degrading to a
-        #    cached number. In-flight reservations (M6) count against availability in
-        #    BOTH paths: a second concurrent order must see the first one's hold
-        #    whether or not it has filled yet.
+        return required
+
+    async def _initial_tier_rate(self, account: Account, symbol_name: str) -> Decimal:
+        """The floating-leverage INITIAL coefficient for one symbol, or 1.
+
+        Measured over the account's open positions through the SAME RiskEngine method the
+        booking path uses, so the gate and the book read one tier table. Short-circuits on
+        `profile is None` before touching the repository, so a group without tiers costs
+        nothing. Every failure degrades to the NEUTRAL coefficient (1) rather than to a
+        refusal: a tier table that cannot be read must not stop the book, and 1 is what MT5
+        gives an instrument no rule matches.
+        """
+        engine = self.risk_engine
+        helper = getattr(engine, "initial_tier_rate", None)
+        if engine is None or not callable(helper) or self.position_repo is None:
+            return Decimal("1")
+        group = getattr(account, "group", None)
+        if getattr(group, "leverage_profile", None) is None:
+            return Decimal("1")
+        try:
+            positions = await self.position_repo.get_by_account(account.login) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "floating-leverage measurement could not read positions for %s: %s; using "
+                "the neutral coefficient", symbol_name, exc)
+            return Decimal("1")
+        try:
+            return Decimal(str(helper(account, symbol_name, positions)))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "floating-leverage coefficient unavailable for %s: %s; using the neutral "
+                "coefficient", symbol_name, exc)
+            return Decimal("1")
+
+    async def required_margin_for(self, order: Order, account: Account, price: Price):
+        """The initial margin `order` needs at `price`, resolved through this service.
+
+        The entry point the order-lifecycle commands use instead of re-deriving a formula.
+        Returns None when the symbol is unknown or the requirement cannot be computed, and
+        callers MUST treat None as a refusal, never as zero.
+        """
+        symbol = None
+        repo = self.symbol_repo
+        if repo is not None:
+            for name in ("find_by_name", "get_symbol"):
+                getter = getattr(repo, name, None)
+                if getter is None:
+                    continue
+                result = getter(order.symbol)
+                if hasattr(result, "__await__"):
+                    result = await result
+                if result is not None:
+                    symbol = result
+                    break
+        if symbol is None:
+            logger.error(
+                "required_margin_for: symbol %s is not configured; cannot cost order %s",
+                order.symbol, getattr(order, "ticket_id", "?"))
+            return None
+        return await self.initial_requirement(order, account, symbol, price)
+
+    async def _available_margin_check(
+        self, order: Order, account: Account, required: Decimal
+    ) -> Optional[Decimal]:
+        """Stage 4 of the gate: is `required` covered? Returns it, or None to refuse.
+
+        Deliberately SEPARATE from `initial_requirement`, so a caller that only needs the
+        number (modify_order) does not also trigger an availability decision.
+
+        NOTE ON PENDING ORDERS (audit R3): the snapshot below is built from POSITIONS only,
+        and that is correct HERE - not an oversight. A resting pending keeps its
+        `margin_reserved` hold for its whole life (nothing releases it until the order fills,
+        is cancelled or expires), so `reserved_now` already carries every working order.
+        Passing `orders` to `calculate_margin_level` as well would count each pending TWICE
+        and refuse orders the account can afford. The booked `margin_used`, which has no
+        reservation column to lean on, is the path that must include them - and does.
+        """
+        from core.domains.market_data.margin import available_margin
+
         reserved_now = (
             account.margin_reserved.amount
             if getattr(account, "margin_reserved", None) is not None
@@ -952,6 +1059,7 @@ class PreTradeRiskService:
             try:
                 open_positions = await self.position_repo.get_by_account(account.login)
                 snapshot = self.risk_engine.calculate_margin_level(account, open_positions)
+                # ^ positions only, on purpose - see the note on this method.
                 # Conservative: a positive unrealised gain is not trusted to authorise a
                 # new position, only a loss reduces availability. This is the rule
                 # tfrmma/oms margin_monitor.hpp documents - a local estimate that has
@@ -1039,10 +1147,20 @@ class PreTradeRiskService:
             # NEVER fire - `GroupSymbolOverride` has no such fields, so both branches were
             # dead code that read like coverage. Removed.
             #
-            # STATED LIMIT: only the two INITIAL market rates (`margin_rate_initial_buy` /
-            # `_sell`) and the maintenance rates are overridable per group. MT5 exposes 16
-            # rate slots; the six pending types have no override field on the entity at all.
-            # That is a modelling gap, recorded here rather than implied by a missing elif.
+            # STATED LIMIT (corrected): only the two INITIAL MARKET rates
+            # (`margin_rate_initial_buy` / `_sell`) can actually arrive here, because those
+            # are the only two fields `GroupSymbolOverride` declares
+            # (core/domains/accounts/value_objects.py) and the only two
+            # `Group.get_symbol_config` returns. The `margin_rate_maintenance_*` branch above
+            # is therefore reachable only if the entity grows those fields - it is kept so
+            # that adding them needs no change here, not because it fires today.
+            #
+            # MT5 exposes 16 rate slots; 14 of them (both maintenance market rates and all
+            # eight pending rates) have no per-group override at all. Consequence worth
+            # knowing: `resolve_rate` inherits a ZERO maintenance rate from the initial one,
+            # so a group override on `initial_buy` also changes the maintenance charge for
+            # open positions on that symbol. That is MT5's inheritance rule, not a bug, but
+            # it means an "initial only" override is not initial only in effect.
         return _replace(spec, rates=rates, **changes)
 
     def _rate_lookup(self, from_currency: str, to_currency: str, side: str):
@@ -1103,7 +1221,6 @@ class PreTradeRiskService:
             )
             return None
         except Exception:  # noqa: BLE001 - an unresolvable rate is a refusal, not a crash
-            return None
             return None
 
     def _market_feed_for_conversion(self) -> Any:

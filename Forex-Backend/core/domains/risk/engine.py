@@ -28,6 +28,8 @@ from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence
 
 from core.domains.market_data.margin import (
+    ONE,
+    ZERO,
     Leg,
     MarginCalculationError,
     SymbolMarginSpec,
@@ -80,6 +82,20 @@ class PositionValuationError(Exception):
 #: Currencies tried as the intermediate leg when triangulating a cross rate.
 #: Ordered by how commonly they are the quote leg of a real symbol list.
 TRIANGULATION_CURRENCIES = ("USD", "EUR", "GBP", "JPY", "CHF", "AUD", "CAD")
+
+
+def _safe_rate(value: Any) -> Decimal:
+    """A tier coefficient as a Decimal, refusing a negative or unreadable one.
+
+    A negative coefficient would make margin negative and read as free money; an
+    unreadable one must not become 0 either, because for leverage tiers 0 legitimately
+    means "no margin charged". Falling back to 1 is the only neutral answer.
+    """
+    try:
+        rate = Decimal(str(value))
+    except (TypeError, ValueError, ArithmeticError):
+        return ONE
+    return rate if rate >= ZERO else ONE
 
 
 class RiskEngine:
@@ -493,15 +509,37 @@ class RiskEngine:
                     )
                 )
             except Exception as exc:  # noqa: BLE001
-                # A pending that cannot be costed must not silently vanish: silently
-                # dropping it is the exact defect this block exists to fix. It is logged,
-                # and the rest of the book is still costed.
+                # N11: FAIL CLOSED. This block used to log and continue, which charged the
+                # un-costable pending ZERO margin - the exact "silently vanish" its own
+                # comment said must not happen. The POSITION loop above propagates the same
+                # error and refuses the whole calculation, so the two sides of one account
+                # disagreed about what "cannot price this" means. Raising the same
+                # PositionValuationError keeps them identical, and every caller already
+                # treats that as "cannot decide" rather than "no margin needed".
                 logger.error(
                     "could not include pending order %s in the margin snapshot: %s",
                     getattr(order, "ticket_id", "?"), exc,
                 )
+                raise PositionValuationError(
+                    f"pending order {getattr(order, 'ticket_id', '?')} cannot be margined: {exc}"
+                ) from exc
 
         leverage = account.effective_leverage()
+
+        equity = account.balance.amount + account.credit.amount + unrealized
+        # R27/N5/N6: the FLOATING-LEVERAGE coefficient, per SYMBOL.
+        #
+        # MT5: floating leverage "allows you to change leverage by applying an
+        # ADDITIONAL COEFFICIENT to the initial and maintenance margin values calculated
+        # in accordance with the symbol settings". The tier does NOT replace the formula -
+        # it multiplies what the symbol settings already produced.
+        #
+        # The coefficient is resolved per symbol and applied INSIDE
+        # `calculate_account_margin`, so this snapshot, `_maintenance_margin` (which the
+        # stop-out selection loop uses) and the booking path cannot disagree about whether
+        # tiers exist. An account-wide coefficient taken from whichever symbol happened to
+        # be iterated first was wrong for MT5's two per-symbol range types.
+        tier_rates = self.leverage_tier_rates(account, positions, specs)
         breakdown = calculate_account_margin(
             legs,
             specs=specs,
@@ -509,20 +547,9 @@ class RiskEngine:
             rate_lookup=self._rate_lookup,
             leverage=leverage,
             maintenance=True,
+            tier_rates=tier_rates,
         )
-
-        equity = account.balance.amount + account.credit.amount + unrealized
-        # R27: apply the FLOATING-LEVERAGE coefficient.
-        #
-        # MT5: floating leverage "allows you to change leverage by applying an
-        # ADDITIONAL COEFFICIENT to the initial and maintenance margin values calculated
-        # in accordance with the symbol settings". The tier does NOT replace the formula -
-        # it multiplies what the symbol settings already produced.
-        #
-        # `select_rates` returns rates of exactly 1 with `applied=False` when no profile
-        # is configured, so a group without tiers is bit-for-bit unchanged.
-        tier = self._leverage_tier_result(account, positions, specs)
-        margin_used = tier.maintenance_margin(breakdown.total)
+        margin_used = breakdown.total
         level = compute_margin_level(equity, margin_used)
         margin_free = equity - margin_used
 
@@ -554,6 +581,89 @@ class RiskEngine:
     # ------------------------------------------------------------------
     # Thresholds
     # ------------------------------------------------------------------
+
+    def leverage_tier_rates(self, account, positions, specs=None) -> Dict[str, tuple]:
+        """`{symbol: (initial_rate, maintenance_rate)}` for MT5 floating leverage.
+
+        Returns an EMPTY dict when the group has no profile, when the group is an exchange
+        group (MT5: the tiers "do not apply for groups with exchange calculation type"), or
+        when the profile cannot be read - so every caller can pass the result straight into
+        `calculate_account_margin(tier_rates=...)` and a group without tiers is bit-for-bit
+        unchanged.
+
+        Public on purpose: the pre-trade gate needs the INITIAL rate for one symbol and the
+        booking path needs the MAINTENANCE rates for all of them, and they must come from
+        one measurement or the gate and the book drift apart (audit N5).
+        """
+        from core.domains.market_data.leverage_tiers import select_rates
+
+        try:
+            group = getattr(account, "group", None)
+            profile = getattr(group, "leverage_profile", None)
+            if profile is None:
+                return {}
+
+            account_type = str(getattr(group, "account_type", "") or "").upper()
+            if "EXCHANGE" in account_type:
+                return {}
+
+            volumes: Dict[str, Decimal] = {}
+            notionals: Dict[str, Decimal] = {}
+            for position in positions:
+                name = position.symbol
+                volume = getattr(getattr(position, "volume", None), "value", None)
+                if volume is None:
+                    continue
+                volume = Decimal(str(volume))
+                volumes[name] = volumes.get(name, ZERO) + volume
+                try:
+                    spec = (specs or {}).get(name) or self._spec(name)
+                    price = getattr(getattr(position, "price_open", None), "value", None)
+                    if price is None:
+                        continue
+                    value = volume * spec.contract_size * Decimal(str(price))
+                    if spec.margin_currency and spec.margin_currency != account.currency:
+                        value = value * self._rate_lookup(
+                            spec.margin_currency, account.currency, "BUY"
+                        )
+                    notionals[name] = notionals.get(name, ZERO) + value
+                except Exception:  # noqa: BLE001
+                    # Without a rate the notional cannot be compared to a Notional-value
+                    # tier, so no notional entry is recorded and a notional rule simply
+                    # does not match. Volume-based rules are unaffected.
+                    continue
+
+            out: Dict[str, tuple] = {}
+            for name in volumes:
+                result = select_rates(
+                    profile,
+                    symbol_name=name,
+                    volumes=volumes,
+                    notionals=notionals,
+                    is_exchange_group=False,
+                )
+                if result is not None and result.applied:
+                    out[name] = (result.initial_rate, result.maintenance_rate)
+            return out
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "could not evaluate floating leverage for account %s: %s; continuing "
+                "with the symbol rates unchanged",
+                getattr(account, "login", "?"), exc,
+            )
+            return {}
+
+    def initial_tier_rate(self, account, symbol_name: str, positions) -> Decimal:
+        """The INITIAL floating-leverage coefficient for one symbol, or ONE.
+
+        What the pre-trade gate multiplies a new order's requirement by, so the gate and
+        the booked margin use the same tier table measured the same way.
+        """
+        rates = self.leverage_tier_rates(account, positions)
+        pair = rates.get(symbol_name)
+        if not pair:
+            return ONE
+        return _safe_rate(pair[0])
 
     def _leverage_tier_result(self, account, positions, specs):
         """The floating-leverage coefficient for this account, or a neutral one.
@@ -762,6 +872,18 @@ class RiskEngine:
             self.symbol_repo = previous_repo
             self.market_data_engine = previous_engine
 
+    def maintenance_margin(self, account: Account, positions: Sequence[Position]) -> Decimal:
+        """PUBLIC: the maintenance margin over an arbitrary subset of positions.
+
+        The liquidation planner needs "what would the requirement be WITHOUT these
+        positions", and it must get the same number the stop-out selection loop and the
+        booked `margin_used` use - same leverage resolver, same tier table, same engine.
+        It previously re-derived one with `Position.calculate_margin_required(
+        margin_rate=1.0)`, a notional/leverage formula that ignores CalcMode and currency
+        (audit N2), so the plan mis-sized how many positions to force-close.
+        """
+        return self._maintenance_margin(account, positions)
+
     def _maintenance_margin(self, account: Account, positions: Sequence[Position]) -> Decimal:
         """Maintenance margin over a set of positions, for the recovery loop."""
         if not positions:
@@ -791,5 +913,10 @@ class RiskEngine:
             rate_lookup=self._rate_lookup,
             leverage=account.effective_leverage(),
             maintenance=True,
+            # N5: the SAME tier table the snapshot uses. Without this the stop-out
+            # selection loop measured an untiered requirement while the trigger that
+            # started it measured a tiered one, so the two disagreed about how many
+            # positions had to close.
+            tier_rates=self.leverage_tier_rates(account, positions, specs),
         )
         return breakdown.total
