@@ -62,14 +62,19 @@ class AuthService:
         if not account:
             raise ValueError("Invalid credentials")
 
-        # Verify password
+        # Verify password (master or investor)
+        is_valid = False
         if self._password_hasher:
-            if not self._password_hasher.verify_password(password, account.password_hash):
-                raise ValueError("Invalid credentials")
+            if self._password_hasher.verify_password(password, account.password_hash):
+                is_valid = True
+            elif account.investor_password_hash and self._password_hasher.verify_password(password, account.investor_password_hash):
+                is_valid = True
         else:
-            # Fallback simple string check if hasher not injected
-            if getattr(account, "password_hash", None) != password:
-                raise ValueError("Invalid credentials")
+            if getattr(account, "password_hash", None) == password or getattr(account, "investor_password_hash", None) == password:
+                is_valid = True
+
+        if not is_valid:
+            raise ValueError("Invalid credentials")
 
         # Issue JWT token
         token = create_access_token(data={"sub": str(login_id), "role": "client"})

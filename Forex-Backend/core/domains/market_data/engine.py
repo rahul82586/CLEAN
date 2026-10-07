@@ -47,6 +47,7 @@ class MarketDataEngine:
         #: weak reference to a running task, so without this a pending write can be
         #: collected before it runs and the entry silently never appears.
         self._cache_tasks: set = set()
+
         self.bar_repository = bar_repository
         self.max_tick_age_seconds = self._resolve_max_tick_age(max_tick_age_seconds)
         #: per-symbol counters so a rejected feed is visible without flooding the log
@@ -192,6 +193,18 @@ class MarketDataEngine:
                 "source": tick.source
             }
         )
+        # AWAITED, deliberately.
+        #
+        # Every local subscriber runs here: the margin pipeline, SlTpWorker, the book
+        # matcher. Making this fire-and-forget raised the observed tick rate from
+        # 1.00/s to roughly the feed's own rate, and broke six tests - stop loss and
+        # take profit stopped firing, resting orders stopped filling. Those consumers
+        # must see the price as it is at the moment they are called, not whenever their
+        # scheduled task happens to run.
+        #
+        # The serial wait is what holds ingestion to ~1/s against a 19.7/s feed. That gap
+        # is real; bounding it is a job for the coalescing window, which already limits
+        # how often the database side revalues, not for decoupling consumers from price.
         await self.event_bus.publish(event)
 
     async def process_book_update(self, symbol: str, bids: List[BookLevel], asks: List[BookLevel]) -> None:
@@ -199,6 +212,7 @@ class MarketDataEngine:
         Process a full Depth of Market (DOM) order book update.
         Called when a liquidity provider or feed sends a market depth snapshot.
         """
+
         sorted_bids = sorted(bids, key=lambda lvl: lvl.price, reverse=True)
         sorted_asks = sorted(asks, key=lambda lvl: lvl.price)
 

@@ -1,0 +1,94 @@
+# ==============================================================================
+# PLUGIN CONFIGURATION - read by master.py
+# ==============================================================================
+# The master process spawns ONE PROCESS PER PLUGIN:
+#     python -m <module> --port <port> --config '<json>'
+#
+# Adding a gateway or a feed is a NEW FILE plus an entry here. master.py never changes.
+#
+# THIS FILE IS CURRENTLY EMPTY OF PLUGINS ON PURPOSE.
+#
+# Your existing MT5 LP server (port 8000) is still started the way it always has been:
+#     uvicorn api.main:app --port 8000
+# It already works, and moving it behind a plugin is a separate, deliberate step.
+#
+# Do NOT add an entry here until the plugin contract exists - a module that does not
+# implement the contract will start, fail to serve, and get restarted in a loop.
+#
+# ------------------------------------------------------------------------------
+# WHAT AN ENTRY LOOKS LIKE
+# ------------------------------------------------------------------------------
+# A GATEWAY: order execution AND quotes (two-way), like the MT5 LP box
+#
+#     - name: lp_mt5
+#       type: gateway                  # gateway | feed | report | core
+#       module: plugins.gateway.lp_mt5   # importable: `python -m plugins.gateway.lp_mt5`
+#       port: 9101
+#       params:
+#         ws_url: "ws://127.0.0.1:8000/ws"
+#         login: "50080"
+#
+# A FEED: quotes only, one-way. No orders ever.
+#
+#     - name: feed_lmax
+#       type: feed
+#       module: plugins.feed.lmax
+#       port: 9102
+#       params:
+#         url: "wss://feeds.example/lmax"
+#         symbols: "EURUSD,GBPUSD,XAUUSD"
+#
+# A REPORTER: reads the ledger. Writes nothing.
+#
+#     - name: report_daily
+#       type: report
+#       module: plugins.report.daily
+#       port: 9103
+#       params:
+#         database_url: "${DATABASE_URL}"     # secret from the environment, not this file
+#
+# ------------------------------------------------------------------------------
+# PROCESS LAYOUT THIS PRODUCES
+# ------------------------------------------------------------------------------
+#   master.py                 <- spawns, watches, restarts. Knows nothing about any plugin.
+#   |_ 8001  backend core   PROCESS_ROLE=core    (default) tick pipeline + risk + workers
+#   |_ 8002  client API     PROCESS_ROLE=client  API only, NO tick pipeline
+#   |_ 9101+ one process per plugin listed below
+#
+#   PostgreSQL               storage
+#   5173                     frontend
+#
+# PROCESS_ROLE=client on 8002 matters: two processes both running a TickMarginPipeline
+# double-write every account row on every tick, and an InProcessEventBus cannot carry a
+# StopOutEntered between them - stop-out fired in one process and the liquidation worker in
+# the other never woke.
+#
+# ------------------------------------------------------------------------------
+# THE CONTRACT A PLUGIN MUST IMPLEMENT
+# ------------------------------------------------------------------------------
+# A gateway (two-way - orders and quotes):
+#     async def get_quote(self, symbol) -> Quote
+#     async def place_order(self, symbol, side, volume, price) -> OrderResult
+#     async def close_position(self, position_id) -> None
+#     async def get_positions(self, login) -> list[Position]
+#
+# A feed (one-way - quotes only):
+#     async def stream_quotes(self) -> AsyncIterator[Quote]
+#
+# A reporter (read-only):
+#     async def report(self, window) -> dict
+#
+# The master passes params through verbatim, so a secret is read from the environment at
+# plugin start and never appears in this file or in a process listing.
+#
+# ------------------------------------------------------------------------------
+
+plugins: []
+
+plugins:
+  - name: demo_feed
+    type: feed
+    module: plugins.demo_feed
+    port: 9199
+    params:
+      note: "proof that the master can spawn a plugin"

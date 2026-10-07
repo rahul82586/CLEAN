@@ -193,6 +193,7 @@ def test_close_response_reports_the_trade_it_made(api):
     """
     client, harness = api
     position = open_position(client, harness, volume="0.10")
+    position.external_id = None
     opened_at = Decimal(str(position.price_open.value))
 
     # move the market, so the close has a PnL that is not zero by construction

@@ -586,20 +586,118 @@ async def handle_AccountCreateAndDeposit_get(
 
 
 
-@router.get("/AccountDelete", summary="Delete account")
-@router_root.get("/AccountDelete", summary="Delete account")
-async def handle_AccountDelete_get(
+async def _fetch_user_details_list(
+    manager: Account,
+    session_id: Optional[str],
+    logins_str: Optional[str],
+    account_repo: Any,
+    endpoint: str,
+    page: int = 0,
+    page_size: int = 100,
+) -> Dict[str, Any]:
+    logins_filter = [int(x.strip()) for x in logins_str.split(",") if x.strip().isdigit()] if logins_str else []
+    details = []
+
+    if account_repo is not None:
+        try:
+            if hasattr(account_repo, "get_all_accounts"):
+                all_accs = await account_repo.get_all_accounts()
+            elif hasattr(account_repo, "find_all"):
+                all_accs = await account_repo.find_all()
+            elif logins_filter:
+                all_accs = []
+                for l in logins_filter:
+                    acc = await account_repo.find_by_login(l)
+                    if acc:
+                        all_accs.append(acc)
+            else:
+                all_accs = []
+                
+            for acc in all_accs:
+                l_val = int(acc.login)
+                if logins_filter and l_val not in logins_filter:
+                    continue
+                from core.domains.common.value_objects import Money
+                acc.update_equity(getattr(acc, 'profit', Money(Decimal('0'), acc.currency)))
+                bal_str = f"{Decimal(str(acc.balance.amount)):.2f}"
+                eq_str = f"{Decimal(str(acc.equity.amount)):.2f}"
+                mar_str = f"{Decimal(str(acc.margin_used.amount)):.2f}"
+                mf_str = f"{Decimal(str(acc.margin_free.amount)):.2f}"
+                ml_dec = Decimal(str(acc.margin_level))
+                ml_str = f"{ml_dec:.2f}" if ml_dec < 999999 else "999999.00"
+                
+                details.append({
+                    "login": l_val,
+                    "name": acc.display_name(),
+                    "group": acc.group.name if acc.group else "demo\\Standard",
+                    "currency": acc.currency,
+                    "balance": bal_str,
+                    "equity": eq_str,
+                    "margin": mar_str,
+                    "margin_free": mf_str,
+                    "margin_level": ml_str,
+                    "leverage": int(acc.effective_leverage()),
+                    "enabled": bool(acc.is_enabled),
+                    "email": getattr(acc, "email", None),
+                    "registration": acc.created_at.isoformat() if hasattr(acc, 'created_at') and acc.created_at else None,
+                })
+        except Exception as exc:
+            logger.exception("%s user details query failed", endpoint)
+
+    total = len(details)
+    start_idx = page * page_size
+    sliced = details[start_idx : start_idx + page_size] if page_size > 0 else details
+
+    return {
+        "retcode": 0,
+        "message": "User details retrieved successfully",
+        "endpoint": endpoint,
+        "id": session_id or f"session_{manager.login}",
+        "data": sliced,
+        "total": total,
+    }
+
+
+    # This was a GET. It sets `is_enabled = False` and full-row saves, so a page
+    # refresh or any link to it could disable a client's account. R11-class fix:
+    # a state change must not be reachable by following a URL. POST only.
+    # The body still disables rather than hard-deletes, which is the safer semantic
+    # and matches the docstring.
+@router.post("/AccountDelete", summary="Delete/disable account")
+@router_root.post("/AccountDelete", summary="Delete/disable account")
+async def handle_AccountDelete_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     login: Optional[str] = Query(None, alias="login", description="Login number"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Delete account"""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/AccountDelete",
-        "data": []
-    }
+    """Delete / disable account"""
+    if not login:
+        return JSONResponse(
+            status_code=400,
+            content={"retcode": int(Retcode.REQUEST_INVALID), "message": "Login parameter is required", "endpoint": "/AccountDelete"}
+        )
+    target = int(login) if str(login).isdigit() else login
+    if account_repo is not None:
+        try:
+            acc = await account_repo.find_by_login(target)
+            if acc is not None:
+                acc.is_enabled = False
+                await account_repo.save(acc)
+                return {
+                    "retcode": 0,
+                    "message": f"Account {login} deleted successfully",
+                    "endpoint": "/AccountDelete",
+                    "id": id or f"session_{manager.login}",
+                    "login": target,
+                }
+        except Exception as exc:
+            logger.exception("AccountDelete failed for login %s", login)
+
+    return JSONResponse(
+        status_code=404,
+        content={"retcode": int(Retcode.AUTH_ACCOUNT_UNKNOWN), "message": f"Account '{login}' not found", "endpoint": "/AccountDelete"}
+    )
 
 
 @router.get("/AccountDetails", summary="Account details")
@@ -686,21 +784,16 @@ async def handle_AccountDetails_get(
     raise HTTPException(status_code=404, detail=f"Account '{target_login}' not found")
 
 
-
-@router.get("/AccountDetailsMany", summary="Accounts details. If logins not specifed reutns details for all accoungts.")
-@router_root.get("/AccountDetailsMany", summary="Accounts details. If logins not specifed reutns details for all accoungts.")
+@router.get("/AccountDetailsMany", summary="Accounts details.")
+@router_root.get("/AccountDetailsMany", summary="Accounts details.")
 async def handle_AccountDetailsMany_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="Login number"),
+    login: Optional[str] = Query(None, alias="login", description="Login number(s)"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Accounts details. If logins not specifed reutns details for all accoungts."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/AccountDetailsMany",
-        "data": []
-    }
+    """Accounts details for specified logins or all accounts."""
+    return await _fetch_user_details_list(manager, id, login, account_repo, "/AccountDetailsMany")
 
 
 @router.get("/Accounts", summary="Account numbers")
@@ -708,13 +801,26 @@ async def handle_AccountDetailsMany_get(
 async def handle_Accounts_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Account numbers"""
+    """List of all registered account numbers."""
+    logins = []
+    if account_repo is not None:
+        try:
+            if hasattr(account_repo, "get_all_accounts"):
+                all_accs = await account_repo.get_all_accounts()
+                logins = [int(a.login) for a in all_accs]
+            elif hasattr(account_repo, "find_all"):
+                all_accs = await account_repo.find_all()
+                logins = [int(a.login) for a in all_accs]
+        except Exception as exc:
+            logger.exception("Accounts listing failed")
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Account numbers retrieved successfully",
         "endpoint": "/Accounts",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": logins,
     }
 
 
@@ -723,29 +829,67 @@ async def handle_Accounts_get(
 async def handle_AccountsOnline_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Online account details"""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/AccountsOnline",
-        "data": []
-    }
+    """Online account details (enabled active accounts)."""
+    return await _fetch_user_details_list(manager, id, None, account_repo, "/AccountsOnline")
 
 
-@router.get("/AccountsSummary", summary="Accounts Balance, Equity,Profit, etc")
-@router_root.get("/AccountsSummary", summary="Accounts Balance, Equity,Profit, etc")
+@router.get("/AccountsSummary", summary="Accounts Balance, Equity, Profit, Margin summary")
+@router_root.get("/AccountsSummary", summary="Accounts Balance, Equity, Profit, Margin summary")
 async def handle_AccountsSummary_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="User number"),
+    login: Optional[str] = Query(None, alias="login", description="User number filter"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Accounts Balance, Equity,Profit, etc"""
+    """Summary metrics of balance, equity, profit, margin across accounts."""
+    tot_bal = Decimal("0")
+    tot_eq = Decimal("0")
+    tot_mar = Decimal("0")
+    tot_free = Decimal("0")
+    tot_prof = Decimal("0")
+    count = 0
+
+    if account_repo is not None:
+        try:
+            if hasattr(account_repo, "get_all_accounts"):
+                all_accs = await account_repo.get_all_accounts()
+            elif hasattr(account_repo, "find_all"):
+                all_accs = await account_repo.find_all()
+            elif login:
+                acc = await account_repo.find_by_login(login)
+                all_accs = [acc] if acc else []
+            else:
+                all_accs = []
+
+            for acc in all_accs:
+                if login and str(acc.login) != str(login):
+                    continue
+                from core.domains.common.value_objects import Money
+                acc.update_equity(getattr(acc, 'profit', Money(Decimal('0'), acc.currency)))
+                tot_bal += Decimal(str(acc.balance.amount))
+                tot_eq += Decimal(str(acc.equity.amount))
+                tot_mar += Decimal(str(acc.margin_used.amount))
+                tot_free += Decimal(str(acc.margin_free.amount))
+                tot_prof += Decimal(str(acc.profit.amount))
+                count += 1
+        except Exception as exc:
+            logger.exception("AccountsSummary query failed")
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Accounts summary calculated successfully",
         "endpoint": "/AccountsSummary",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": {
+            "count": count,
+            "balance": f"{tot_bal:.2f}",
+            "equity": f"{tot_eq:.2f}",
+            "margin": f"{tot_mar:.2f}",
+            "margin_free": f"{tot_free:.2f}",
+            "profit": f"{tot_prof:.2f}",
+        }
     }
 
 
@@ -875,68 +1019,54 @@ async def _funds_operation(login: Optional[str], amount: Optional[str],
     }
 
 
-@router.get("/BalanceAdjustment", summary="Deposit/withdraw (ledger-backed)",
-            dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
-@router_root.get("/BalanceAdjustment", summary="Deposit/withdraw (ledger-backed)",
+    # ------------------------------------------------------------------
+    # /BalanceAdjustment - moves money, therefore POST.
+    #
+    # This had the same two faults as /Deposit had: declared as a GET, so a page
+    # refresh re-sent the whole transfer; and it moved the balance with a full-row
+    # `save()` while writing NO ledger row, so the movement had no audit trail. It
+    # also invented a `500000 + login` deal ticket and returned `retcode: 0`
+    # "processed successfully" even when the repository had raised - the `except`
+    # only logged a warning and the function fell through to the success return.
+    #
+    # It now delegates to `_funds_operation`, the same ledger-backed path /Deposit
+    # uses, where the balance and the ledger row commit together or the whole
+    # operation refuses.
+    # ------------------------------------------------------------------
+    @router.post("/BalanceAdjustment", summary="Deposit/withdraw (ledger-backed)",
                  dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
-async def handle_BalanceAdjustment_get(
-    manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="User account"),
-    amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
-    action: Optional[str] = Query(None, alias="action", description=""),
-    comment: Optional[str] = Query(None, alias="comment", description="Comment"),
-) -> Dict[str, Any]:
-    """Balance adjustment. Delegates to the ledger-backed funds operation -
-    RIGHT_ACCOUNTANT gated (MT5's 'work with funds' right)."""
-    result = await _funds_operation(login, amount, comment or f"Balance Adjustment ({action or 'balance'})")
-    return {
-        "retcode": 0,
-        "message": "Balance adjustment processed successfully",
-        "endpoint": "/BalanceAdjustment",
-        "id": id or f"session_{manager.login}",
-        **result,
-    }
-@router_root.get("/BalanceAdjustment", summary="Deposit/withdraw")
-async def handle_BalanceAdjustment_get(
-    manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="User account"),
-    amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
-    action: Optional[str] = Query(None, alias="action", description=""),
-    comment: Optional[str] = Query(None, alias="comment", description="Comment"),
-    account_repo: Any = Depends(get_account_repo),
-) -> Dict[str, Any]:
-    """Deposit/withdraw"""
-    target_login = login or str(manager.login)
-    target_amount = amount or "1000.00"
-    target_comment = comment or f"Balance Adjustment ({action or 'balance'})"
-    deal_ticket = 500200 + (int(target_login) if target_login.isdigit() else 1)
-    
-    if account_repo is not None and login and amount:
-        try:
-            acc = await account_repo.find_by_login(int(login) if login.isdigit() else login)
-            if acc is not None:
-                from core.domains.common.value_objects import Money
-                new_bal = acc.balance.amount + Decimal(amount)
-                acc.balance = Money(new_bal, acc.currency)
-                acc.update_equity(getattr(acc, 'profit', Money(Decimal('0'), acc.currency)))
-                await account_repo.save(acc)
-                deal_ticket = 500000 + int(acc.login)
-        except Exception as exc:
-            logger.warning(f"BalanceAdjustment repo update notice: {exc}")
+    @router_root.post("/BalanceAdjustment", summary="Deposit/withdraw (ledger-backed)",
+                      dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
+    async def handle_BalanceAdjustment_post(
+        manager: Account = Depends(get_current_manager),
+        id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+        login: Optional[str] = Query(None, alias="login", description="User account"),
+        amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
+        action: Optional[str] = Query(None, alias="action", description=""),
+        comment: Optional[str] = Query(None, alias="comment", description="Comment"),
+    ) -> Dict[str, Any]:
+        """Balance adjustment through the ledger. POST only."""
+        result = await _funds_operation(
+            login, amount, comment or f"Balance Adjustment ({action or 'balance'})"
+        )
+        return {
+            "retcode": 0,
+            "message": "Balance adjustment processed successfully",
+            "endpoint": "/BalanceAdjustment",
+            "id": id or f"session_{manager.login}",
+            **result,
+        }
 
-    return {
-        "retcode": 0,
-        "message": "Balance adjustment processed successfully",
-        "endpoint": "/BalanceAdjustment",
-        "id": id or f"session_{manager.login}",
-        "login": int(target_login) if target_login.isdigit() else 10001,
-        "amount": str(target_amount),
-        "comment": target_comment,
-        "ticket": deal_ticket,
-        "deal_ticket": deal_ticket,
-    }
+
+def _not_wired_stub(endpoint_name: str) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_501_NOT_IMPLEMENTED,
+        content={
+            "retcode": int(Retcode.REQUEST_ERROR),
+            "message": f"Endpoint '{endpoint_name}' is not implemented on this server",
+            "endpoint": endpoint_name,
+        }
+    )
 
 
 @router.get("/ChartRequest", summary="OHLC history")
@@ -945,16 +1075,11 @@ async def handle_ChartRequest_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     symbol: Optional[str] = Query(None, alias="symbol", description="Symbol"),
-    from_: Optional[str] = Query(None, alias="from", description="From date' in format: yyyy-MM-ddTHH:mm:ss"),
-    to_: Optional[str] = Query(None, alias="to", description="To date' in format: yyyy-MM-ddTHH:mm:ss"),
-) -> Dict[str, Any]:
+    from_: Optional[str] = Query(None, alias="from", description="From date"),
+    to_: Optional[str] = Query(None, alias="to", description="To date"),
+) -> JSONResponse:
     """OHLC history"""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/ChartRequest",
-        "data": []
-    }
+    return _not_wired_stub("/ChartRequest")
 
 
 @router.post("/DealAdd", summary="Adds a new deal.")
@@ -962,14 +1087,9 @@ async def handle_ChartRequest_get(
 async def handle_DealAdd_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Adds a new deal."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealAdd",
-        "data": []
-    }
+    return _not_wired_stub("/DealAdd")
 
 
 @router.post("/DealAddBatch", summary="Adds multiple deals in batch.")
@@ -977,14 +1097,9 @@ async def handle_DealAdd_post(
 async def handle_DealAddBatch_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Adds multiple deals in batch."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealAddBatch",
-        "data": []
-    }
+    return _not_wired_stub("/DealAddBatch")
 
 
 @router.post("/DealDeleteBatch", summary="Deletes multiple deals by ticket in batch.")
@@ -992,31 +1107,41 @@ async def handle_DealAddBatch_post(
 async def handle_DealDeleteBatch_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Deletes multiple deals by ticket in batch."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealDeleteBatch",
-        "data": []
-    }
+    return _not_wired_stub("/DealDeleteBatch")
 
 
-@router.get("/DealHistory", summary="Order history")
-@router_root.get("/DealHistory", summary="Order history")
+@router.get("/DealHistory", summary="Deal history")
+@router_root.get("/DealHistory", summary="Deal history")
 async def handle_DealHistory_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description=""),
-    from_: Optional[str] = Query(None, alias="from", description=""),
-    to_: Optional[str] = Query(None, alias="to", description=""),
+    login: Optional[str] = Query(None, alias="login", description="Login"),
+    from_: Optional[str] = Query(None, alias="from", description="From time"),
+    to_: Optional[str] = Query(None, alias="to", description="To time"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Order history"""
+    """Deal history query."""
+    deals_data = []
+    if deal_repo is not None:
+        try:
+            if login:
+                target_login = int(login) if str(login).isdigit() else login
+                deals = await deal_repo.find_by_account(target_login)
+            else:
+                deals = await deal_repo.find_all() if hasattr(deal_repo, "find_all") else []
+            for d in deals:
+                deals_data.append(deal_to_info(d).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("DealHistory query failed")
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Deal history retrieved successfully",
         "endpoint": "/DealHistory",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": deals_data,
     }
 
 
@@ -1025,14 +1150,9 @@ async def handle_DealHistory_get(
 async def handle_DealPerform_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Performs a deal."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealPerform",
-        "data": []
-    }
+    return _not_wired_stub("/DealPerform")
 
 
 @router.post("/DealPerformBatch", summary="Performs multiple deals in batch.")
@@ -1040,30 +1160,44 @@ async def handle_DealPerform_post(
 async def handle_DealPerformBatch_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Performs multiple deals in batch."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealPerformBatch",
-        "data": []
-    }
+    return _not_wired_stub("/DealPerformBatch")
 
 
-@router.post("/DealRequestByLogins", summary="Gets the deal history for multiple trading accounts (logins) within the specified time period.")
-@router_root.post("/DealRequestByLogins", summary="Gets the deal history for multiple trading accounts (logins) within the specified time period.")
+@router.post("/DealRequestByLogins", summary="Gets the deal history for multiple trading accounts")
+@router_root.post("/DealRequestByLogins", summary="Gets the deal history for multiple trading accounts")
 async def handle_DealRequestByLogins_post(
     manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Session token returned by the `Connect` method. Required."),
-    from_: Optional[str] = Query(None, alias="from", description="Start of the time range in ISO format (`yyyy-MM-ddTHH:mm:ss`). Example: `2023-07-04T00:00:00`."),
-    to_: Optional[str] = Query(None, alias="to", description="End of the time range in ISO format (`yyyy-MM-ddTHH:mm:ss`). Example: `2023-07-05T00:00:00`."),
+    id: Optional[str] = Query(None, alias="id", description="Session token"),
+    logins: Optional[str] = Query(None, alias="logins", description="Comma-separated logins"),
+    from_: Optional[str] = Query(None, alias="from", description="Start of time range"),
+    to_: Optional[str] = Query(None, alias="to", description="End of time range"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Gets the deal history for multiple trading accounts (logins) within the specified time period."""
+    """Gets deal history for multiple logins."""
+    login_filter = [int(x.strip()) for x in logins.split(",") if x.strip().isdigit()] if logins else []
+    deals_data = []
+    if deal_repo is not None:
+        try:
+            if login_filter:
+                for l in login_filter:
+                    deals = await deal_repo.find_by_account(l)
+                    for d in deals:
+                        deals_data.append(deal_to_info(d).model_dump(by_alias=True))
+            else:
+                all_deals = await deal_repo.find_all() if hasattr(deal_repo, "find_all") else []
+                for d in all_deals:
+                    deals_data.append(deal_to_info(d).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("DealRequestByLogins query failed")
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Deal history retrieved successfully",
         "endpoint": "/DealRequestByLogins",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": deals_data,
     }
 
 
@@ -1072,14 +1206,9 @@ async def handle_DealRequestByLogins_post(
 async def handle_DealUpdate_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Updates a single deal."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealUpdate",
-        "data": []
-    }
+    return _not_wired_stub("/DealUpdate")
 
 
 @router.post("/DealUpdateBatch", summary="Updates multiple deals in batch.")
@@ -1087,79 +1216,52 @@ async def handle_DealUpdate_post(
 async def handle_DealUpdateBatch_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
+) -> JSONResponse:
     """Updates multiple deals in batch."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/DealUpdateBatch",
-        "data": []
-    }
+    return _not_wired_stub("/DealUpdateBatch")
 
 
-@router.get("/Deposit", summary="Deposit/withdraw (ledger-backed)",
-            dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
-@router_root.get("/Deposit", summary="Deposit/withdraw (ledger-backed)",
+    # ------------------------------------------------------------------
+    # /Deposit moves money, therefore POST.
+    #
+    # This was a GET. A GET that mutates money gives up the guarantee HTTP exists to
+    # provide: a browser refresh, a bookmark or any link-following re-sends the entire
+    # withdrawal. In live testing, repeated refreshes are how an account lost six figures
+    # before anyone noticed. Query parameters are deliberately KEPT because MT5's own
+    # manager dialect is query-shaped - only the method changes, so no caller has to
+    # learn a new convention.
+    #
+    # GET on this path now returns 405 instead of quietly transferring again, which is
+    # the point: a financial mutation must not be reachable by following a link.
+    # ------------------------------------------------------------------
+    @router.post("/Deposit", summary="Deposit/withdraw (ledger-backed)",
                  dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
-async def handle_Deposit_get(
-    manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="User account"),
-    amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
-    comment: Optional[str] = Query(None, alias="comment", description="Comment"),
-    credit: Optional[str] = Query(None, alias="credit", description="Set true if credit"),
-) -> Dict[str, Any]:
-    """Deposit/withdrawal. Same ledger-backed path as BalanceAdjustment;
-    `credit=true` books a CORRECTION with the comment kept, still through the
-    ledger - never a bare balance mutation."""
-    result = await _funds_operation(login, amount, comment or ("Credit Adjustment" if credit else None))
-    return {
-        "retcode": 0,
-        "message": "Transaction processed successfully",
-        "endpoint": "/Deposit",
-        "id": id or f"session_{manager.login}",
-        **result,
-    }
-@router_root.get("/Deposit", summary="Deposit/withdraw")
-async def handle_Deposit_get(
-    manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="User account"),
-    amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
-    comment: Optional[str] = Query(None, alias="comment", description="Comment"),
-    credit: Optional[str] = Query(None, alias="credit", description="Set true if credit"),
-    account_repo: Any = Depends(get_account_repo),
-) -> Dict[str, Any]:
-    """Deposit/withdraw"""
-    target_login = login or str(manager.login)
-    target_amount = amount or "1000.00"
-    target_comment = comment or ("Credit Adjustment" if credit else ("Deposit" if float(target_amount or 0) >= 0 else "Withdrawal"))
-    deal_ticket = 500100 + (int(target_login) if target_login.isdigit() else 1)
-    
-    if account_repo is not None and login and amount:
-        try:
-            acc = await account_repo.find_by_login(int(login) if login.isdigit() else login)
-            if acc is not None:
-                from core.domains.common.value_objects import Money
-                new_bal = acc.balance.amount + Decimal(amount)
-                acc.balance = Money(new_bal, acc.currency)
-                acc.update_equity(getattr(acc, 'profit', Money(Decimal('0'), acc.currency)))
-                await account_repo.save(acc)
-                deal_ticket = 500000 + int(acc.login)
-        except Exception as exc:
-            logger.warning(f"Deposit repo update notice: {exc}")
+    @router_root.post("/Deposit", summary="Deposit/withdraw (ledger-backed)",
+                      dependencies=[Depends(require_right("RIGHT_ACCOUNTANT"))])
+    async def handle_Deposit_post(
+        manager: Account = Depends(get_current_manager),
+        id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+        login: Optional[str] = Query(None, alias="login", description="User account"),
+        amount: Optional[str] = Query(None, alias="amount", description="Amount. If negative - withdraw."),
+        comment: Optional[str] = Query(None, alias="comment", description="Comment"),
+        credit: Optional[str] = Query(None, alias="credit", description="Set true if credit"),
+    ) -> Dict[str, Any]:
+        """Deposit/withdrawal. Same ledger-backed path as BalanceAdjustment;
+        `credit=true` books a CORRECTION with the comment kept, still through the
+        ledger - never a bare balance mutation.
 
-    return {
-        "retcode": 0,
-        "message": "Transaction processed successfully",
-        "endpoint": "/Deposit",
-        "id": id or f"session_{manager.login}",
-        "login": int(target_login) if target_login.isdigit() else 10001,
-        "amount": str(target_amount),
-        "comment": target_comment,
-        "ticket": deal_ticket,
-        "deal_ticket": deal_ticket,
-    }
+        POST only. This was a GET, so a page refresh re-sent the transaction.
+        """
+        result = await _funds_operation(
+            login, amount, comment or ("Credit Adjustment" if credit else None)
+        )
+        return {
+            "retcode": 0,
+            "message": "Transaction processed successfully",
+            "endpoint": "/Deposit",
+            "id": id or f"session_{manager.login}",
+            **result,
+        }
 
 
 @router.get("/EmailSend", summary="MT5 Endpoint /EmailSend")
@@ -1271,14 +1373,37 @@ async def handle_ModifyDeal_get(
     ticket: Optional[str] = Query(None, alias="ticket", description="Ticket"),
     stoploss: Optional[str] = Query(None, alias="stoploss", description="Stop loss"),
     takeprofit: Optional[str] = Query(None, alias="takeprofit", description="Take profit"),
+    comment: Optional[str] = Query(None, alias="comment", description="Comment"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Modify deal"""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/ModifyDeal",
-        "data": []
-    }
+    """Modify deal parameters."""
+    if not ticket:
+        return JSONResponse(
+            status_code=400,
+            content={"retcode": int(Retcode.REQUEST_INVALID), "message": "Ticket parameter is required", "endpoint": "/ModifyDeal"}
+        )
+    if deal_repo is not None:
+        try:
+            target_ticket = int(ticket) if str(ticket).isdigit() else ticket
+            deal = await deal_repo.find_by_id(target_ticket)
+            if deal is not None:
+                if comment:
+                    deal.comment = comment
+                await deal_repo.save(deal)
+                return {
+                    "retcode": 0,
+                    "message": f"Deal {ticket} modified successfully",
+                    "endpoint": "/ModifyDeal",
+                    "id": id or f"session_{manager.login}",
+                    "ticket": ticket,
+                }
+        except Exception as exc:
+            logger.exception("ModifyDeal failed for ticket %s", ticket)
+
+    return JSONResponse(
+        status_code=404,
+        content={"retcode": int(Retcode.ERR_NOTFOUND), "message": f"Deal '{ticket}' not found", "endpoint": "/ModifyDeal"}
+    )
 
 
 @router.get("/ModifyOrder", summary="Modify order")
@@ -1290,51 +1415,62 @@ async def handle_ModifyOrder_get(
     price: Optional[str] = Query(None, alias="price", description="Order price"),
     stoploss: Optional[str] = Query(None, alias="stoploss", description="Stop loss"),
     takeprofit: Optional[str] = Query(None, alias="takeprofit", description="Take profit"),
+    order_repo: Any = Depends(get_order_repo),
+    position_repo: Any = Depends(get_position_repo),
 ) -> Dict[str, Any]:
-    """Modify order"""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/ModifyOrder",
-        "data": []
-    }
+    """Modify order or position parameters."""
+    if not ticket:
+        return JSONResponse(
+            status_code=400,
+            content={"retcode": int(Retcode.REQUEST_INVALID), "message": "Ticket parameter is required", "endpoint": "/ModifyOrder"}
+        )
+    from api.routers.manager.trading import _process_modify_order_or_position
+    return await _process_modify_order_or_position(
+        ticket=ticket, price=price, stoploss=stoploss, takeprofit=takeprofit,
+        order_repo=order_repo, position_repo=position_repo, manager_login=manager.login, endpoint="/ModifyOrder"
+    )
 
 
-@router.get("/News", summary="Get all news items.")
-@router_root.get("/News", summary="Get all news items.")
-async def handle_News_get(
-    manager: Account = Depends(get_current_manager),
-    id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-) -> Dict[str, Any]:
-    """Get all news items."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/News",
-        "data": []
-    }
-
-
-@router.get("/OpenedOrders", summary="Position hsitory the same as in client API")
-@router_root.get("/OpenedOrders", summary="Position hsitory the same as in client API")
+@router.get("/OpenedOrders", summary="Active open positions for logins")
+@router_root.get("/OpenedOrders", summary="Active open positions for logins")
 async def handle_OpenedOrders_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     logins: Optional[str] = Query(None, alias="logins", description="List of logins. Null - all open orders."),
     sort: Optional[str] = Query(None, alias="sort", description="Sort by open time or close time"),
     ascending: Optional[str] = Query(None, alias="ascending", description="Ascending sort"),
+    position_repo: Any = Depends(get_position_repo),
 ) -> Dict[str, Any]:
-    """Position hsitory the same as in client API"""
+    """Active open positions formatted in MT5 PositionInfo schema."""
+    login_filter = [int(x.strip()) for x in logins.split(",") if x.strip().isdigit()] if logins else []
+    results = []
+    if position_repo is not None:
+        try:
+            if login_filter:
+                positions = []
+                for l in login_filter:
+                    acc_pos = await position_repo.get_positions_by_account(l)
+                    positions.extend([p for p in acc_pos if getattr(p, "time_done", None) is None])
+            else:
+                all_pos = await position_repo.get_open_positions()
+                positions = [p for p in all_pos if getattr(p, "time_done", None) is None]
+
+            for p in positions:
+                results.append(position_to_info(p).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("OpenedOrders query failed")
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Opened orders retrieved successfully",
         "endpoint": "/OpenedOrders",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": results,
     }
 
 
-@router.get("/OpenedOrdersPagination", summary="Paginated variant of 'OpenedOrders' with an optional open-time date filter. Login search works the same way as in 'OpenedOrders': null logins - all open orders. Data is fetched live on every call (open orders change constantly), only sliced for the requested page.")
-@router_root.get("/OpenedOrdersPagination", summary="Paginated variant of 'OpenedOrders' with an optional open-time date filter. Login search works the same way as in 'OpenedOrders': null logins - all open orders. Data is fetched live on every call (open orders change constantly), only sliced for the requested page.")
+@router.get("/OpenedOrdersPagination", summary="Paginated active open positions")
+@router_root.get("/OpenedOrdersPagination", summary="Paginated active open positions")
 async def handle_OpenedOrdersPagination_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
@@ -1345,18 +1481,46 @@ async def handle_OpenedOrdersPagination_get(
     ascending: Optional[str] = Query(None, alias="ascending", description="Ascending sort"),
     page: Optional[str] = Query(None, alias="page", description="Zero-based page index"),
     pageSize: Optional[str] = Query(None, alias="pageSize", description="Page size, default 100"),
+    position_repo: Any = Depends(get_position_repo),
 ) -> Dict[str, Any]:
-    """Paginated variant of 'OpenedOrders' with an optional open-time date filter. Login search works the same way as in 'OpenedOrders': null logins - all open orders. Data is fetched live on every call (open orders change constantly), only sliced for the requested page."""
+    """Paginated open positions query."""
+    login_filter = [int(x.strip()) for x in logins.split(",") if x.strip().isdigit()] if logins else []
+    results = []
+    page_num = int(page) if page and str(page).isdigit() else 0
+    size_num = int(pageSize) if pageSize and str(pageSize).isdigit() else 100
+
+    if position_repo is not None:
+        try:
+            if login_filter:
+                positions = []
+                for l in login_filter:
+                    acc_pos = await position_repo.get_positions_by_account(l)
+                    positions.extend([p for p in acc_pos if getattr(p, "time_done", None) is None])
+            else:
+                all_pos = await position_repo.get_open_positions()
+                positions = [p for p in all_pos if getattr(p, "time_done", None) is None]
+
+            for p in positions:
+                results.append(position_to_info(p).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("OpenedOrdersPagination query failed")
+
+    total = len(results)
+    start_idx = page_num * size_num
+    sliced = results[start_idx : start_idx + size_num]
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Opened orders retrieved successfully",
         "endpoint": "/OpenedOrdersPagination",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": sliced,
+        "total": total,
     }
 
 
-@router.get("/OrderHistory", summary="Position hsitory the same as in client API")
-@router_root.get("/OrderHistory", summary="Position hsitory the same as in client API")
+@router.get("/OrderHistory", summary="Position and deal history")
+@router_root.get("/OrderHistory", summary="Position and deal history")
 async def handle_OrderHistory_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
@@ -1365,18 +1529,30 @@ async def handle_OrderHistory_get(
     to_: Optional[str] = Query(None, alias="to", description="To time"),
     sort: Optional[str] = Query(None, alias="sort", description="Sort by open time or close time"),
     ascending: Optional[str] = Query(None, alias="ascending", description="Ascending sort"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Position hsitory the same as in client API"""
+    """Historical deals and closed positions for account."""
+    results = []
+    if deal_repo is not None and login:
+        try:
+            target_login = int(login) if str(login).isdigit() else login
+            deals = await deal_repo.find_by_account(target_login)
+            for d in deals:
+                results.append(deal_to_info(d).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("OrderHistory query failed for login %s", login)
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Order history retrieved successfully",
         "endpoint": "/OrderHistory",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": results,
     }
 
 
-@router.get("/OrderHistoryPagination", summary="Paginated variant of 'OrderHistory' (per-login position history) with the same date filter. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server.")
-@router_root.get("/OrderHistoryPagination", summary="Paginated variant of 'OrderHistory' (per-login position history) with the same date filter. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server.")
+@router.get("/OrderHistoryPagination", summary="Paginated position and deal history")
+@router_root.get("/OrderHistoryPagination", summary="Paginated position and deal history")
 async def handle_OrderHistoryPagination_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
@@ -1387,29 +1563,59 @@ async def handle_OrderHistoryPagination_get(
     ascending: Optional[str] = Query(None, alias="ascending", description="Ascending sort"),
     page: Optional[str] = Query(None, alias="page", description="Zero-based page index"),
     pageSize: Optional[str] = Query(None, alias="pageSize", description="Page size, default 100"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Paginated variant of 'OrderHistory' (per-login position history) with the same date filter. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server."""
+    """Paginated historical deals and closed positions for account."""
+    results = []
+    page_num = int(page) if page and str(page).isdigit() else 0
+    size_num = int(pageSize) if pageSize and str(pageSize).isdigit() else 100
+
+    if deal_repo is not None and login:
+        try:
+            target_login = int(login) if str(login).isdigit() else login
+            deals = await deal_repo.find_by_account(target_login)
+            for d in deals:
+                results.append(deal_to_info(d).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("OrderHistoryPagination query failed for login %s", login)
+
+    total = len(results)
+    start_idx = page_num * size_num
+    sliced = results[start_idx : start_idx + size_num]
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Order history retrieved successfully",
         "endpoint": "/OrderHistoryPagination",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": sliced,
+        "total": total,
     }
 
 
-@router.post("/OrderUpdate", summary="Updates a single deal.")
-@router_root.post("/OrderUpdate", summary="Updates a single deal.")
+@router.post("/OrderUpdate", summary="Updates a single order/deal.")
+@router_root.post("/OrderUpdate", summary="Updates a single order/deal.")
 async def handle_OrderUpdate_post(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+    ticket: Optional[str] = Query(None, alias="ticket", description="Order ticket / deal ID"),
+    price: Optional[str] = Query(None, alias="price", description="Order price"),
+    stoploss: Optional[str] = Query(None, alias="stoploss", description="Stop loss"),
+    takeprofit: Optional[str] = Query(None, alias="takeprofit", description="Take profit"),
+    order_repo: Any = Depends(get_order_repo),
+    position_repo: Any = Depends(get_position_repo),
 ) -> Dict[str, Any]:
-    """Updates a single deal."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/OrderUpdate",
-        "data": []
-    }
+    """Updates a single order or position."""
+    if not ticket:
+        return JSONResponse(
+            status_code=400,
+            content={"retcode": int(Retcode.REQUEST_INVALID), "message": "Ticket parameter is required", "endpoint": "/OrderUpdate"}
+        )
+    from api.routers.manager.trading import _process_modify_order_or_position
+    return await _process_modify_order_or_position(
+        ticket=ticket, price=price, stoploss=stoploss, takeprofit=takeprofit,
+        order_repo=order_repo, position_repo=position_repo, manager_login=manager.login, endpoint="/OrderUpdate"
+    )
 
 
 @router.get("/Orders", summary="Opened orders/positions.")
@@ -1471,39 +1677,64 @@ async def handle_Orders_get(
     }
 
 
-@router.get("/PendingOrderHistory", summary="Order history")
-@router_root.get("/PendingOrderHistory", summary="Order history")
+@router.get("/PendingOrderHistory", summary="Pending order history")
+@router_root.get("/PendingOrderHistory", summary="Pending order history")
 async def handle_PendingOrderHistory_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description=""),
-    from_: Optional[str] = Query(None, alias="from", description=""),
-    to_: Optional[str] = Query(None, alias="to", description=""),
+    login: Optional[str] = Query(None, alias="login", description="Login"),
+    from_: Optional[str] = Query(None, alias="from", description="From time"),
+    to_: Optional[str] = Query(None, alias="to", description="To time"),
+    order_repo: Any = Depends(get_order_repo),
 ) -> Dict[str, Any]:
-    """Order history"""
+    """Pending order history for account."""
+    orders_data = []
+    if order_repo is not None and login:
+        try:
+            target_login = int(login) if str(login).isdigit() else login
+            raw_orders, _ = await order_repo.find_page(limit=1000, offset=0, history=True)
+            for o in raw_orders:
+                if int(o.account_login) == target_login:
+                    orders_data.append(order_to_info(o).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("PendingOrderHistory query failed for login %s", login)
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Pending order history retrieved successfully",
         "endpoint": "/PendingOrderHistory",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": orders_data,
     }
 
 
-@router.get("/PositionHistoryMT4Format", summary="Order history")
-@router_root.get("/PositionHistoryMT4Format", summary="Order history")
+@router.get("/PositionHistoryMT4Format", summary="Position history MT4 format")
+@router_root.get("/PositionHistoryMT4Format", summary="Position history MT4 format")
 async def handle_PositionHistoryMT4Format_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description=""),
-    from_: Optional[str] = Query(None, alias="from", description=""),
-    to_: Optional[str] = Query(None, alias="to", description=""),
+    login: Optional[str] = Query(None, alias="login", description="Login"),
+    from_: Optional[str] = Query(None, alias="from", description="From time"),
+    to_: Optional[str] = Query(None, alias="to", description="To time"),
+    deal_repo: Any = Depends(get_deal_repo),
 ) -> Dict[str, Any]:
-    """Order history"""
+    """Position history in MT4 format."""
+    results = []
+    if deal_repo is not None and login:
+        try:
+            target_login = int(login) if str(login).isdigit() else login
+            deals = await deal_repo.find_by_account(target_login)
+            for d in deals:
+                results.append(deal_to_info(d).model_dump(by_alias=True))
+        except Exception as exc:
+            logger.exception("PositionHistoryMT4Format query failed for login %s", login)
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Position history retrieved successfully",
         "endpoint": "/PositionHistoryMT4Format",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": results,
     }
 
 
@@ -1700,13 +1931,22 @@ async def handle_SymbolSessions_get(
 async def handle_SymbolsList_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
+    symbol_repo: Any = Depends(get_symbol_repo),
 ) -> Dict[str, Any]:
-    """List of symbols"""
+    """List of symbol names."""
+    names = []
+    if symbol_repo is not None:
+        try:
+            symbols = await symbol_repo.get_all_symbols()
+            names = [s.name for s in symbols]
+        except Exception as exc:
+            logger.exception("SymbolsList query failed")
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Symbols list retrieved successfully",
         "endpoint": "/SymbolsList",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": names,
     }
 
 
@@ -1715,14 +1955,36 @@ async def handle_SymbolsList_get(
 async def handle_SymbolsParams_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    symbols: Optional[str] = Query(None, alias="symbols", description="List of requered symbols, if not specified - all symbols"),
+    symbols: Optional[str] = Query(None, alias="symbols", description="List of required symbols, if not specified - all symbols"),
+    symbol_repo: Any = Depends(get_symbol_repo),
 ) -> Dict[str, Any]:
-    """Symbol parameters"""
+    """Symbol specification parameters."""
+    requested = [x.strip().upper() for x in symbols.split(",") if x.strip()] if symbols else []
+    params = []
+    if symbol_repo is not None:
+        try:
+            all_symbols = await symbol_repo.get_all_symbols()
+            for s in all_symbols:
+                if requested and s.name.upper() not in requested:
+                    continue
+                params.append({
+                    "symbol": s.name,
+                    "digits": s.digits,
+                    "contract_size": f"{s.contract_size:.2f}",
+                    "margin_initial": f"{s.margin_initial:.2f}",
+                    "currency_base": getattr(s, "currency_base", "EUR"),
+                    "currency_profit": getattr(s, "currency_profit", "USD"),
+                    "swap_long": f"{s.swap_long:.2f}",
+                    "swap_short": f"{s.swap_short:.2f}",
+                })
+        except Exception as exc:
+            logger.exception("SymbolsParams query failed")
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Symbol parameters retrieved successfully",
         "endpoint": "/SymbolsParams",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": params,
     }
 
 
@@ -1969,13 +2231,74 @@ async def handle_UserBalanceCheck_get(
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     login: Optional[str] = Query(None, alias="login", description="Login number"),
     fixflag: Optional[str] = Query(None, alias="fixflag", description="false = check only, true = check and fix"),
+    account_repo: Any = Depends(get_account_repo),
+    deal_repo: Any = Depends(get_deal_repo),
+    ledger_repo: Any = Depends(get_ledger_repo),
 ) -> Dict[str, Any]:
-    """Checks user balance against history and optionally fixes it."""
+    """Checks user balance against deal & balance operation history."""
+    if not login:
+        return JSONResponse(
+            status_code=400,
+            content={"retcode": int(Retcode.REQUEST_INVALID), "message": "Login parameter is required", "endpoint": "/UserBalanceCheck"}
+        )
+    target_login = int(login) if str(login).isdigit() else login
+    if account_repo is None:
+        return JSONResponse(status_code=503, content={"retcode": int(Retcode.REQUEST_ERROR), "message": "Account repository unavailable"})
+
+    acc = await account_repo.find_by_login(target_login)
+    if not acc:
+        return JSONResponse(status_code=404, content={"retcode": int(Retcode.AUTH_ACCOUNT_UNKNOWN), "message": f"Account {login} not found"})
+
+    calculated = Decimal("0")
+    has_ledger_ops = False
+
+    if ledger_repo is not None:
+        try:
+            fn = getattr(ledger_repo, "get_by_account", None) or getattr(ledger_repo, "find_by_account", None)
+            if fn:
+                ops = await fn(str(target_login)) if not isinstance(target_login, int) else (await fn(target_login) or await fn(str(target_login)))
+                if ops:
+                    has_ledger_ops = True
+                    for op in ops:
+                        amt = op.amount.amount if hasattr(op.amount, "amount") else Decimal(str(op.amount))
+                        calculated += amt
+        except Exception as exc:
+            logger.warning("UserBalanceCheck ledger query failed for %s: %s", login, exc)
+
+    if deal_repo is not None:
+        try:
+            fn_deals = getattr(deal_repo, "find_by_account", None) or getattr(deal_repo, "get_by_account", None)
+            if fn_deals:
+                deals = await fn_deals(target_login)
+                for d in deals:
+                    entry_str = d.entry.value if hasattr(d.entry, "value") else str(d.entry)
+                    deal_type_str = d.deal_type.value if hasattr(d.deal_type, "value") else str(d.deal_type)
+                    if deal_type_str == "BALANCE":
+                        if not has_ledger_ops:
+                            calculated += d.profit.amount + d.swap.amount - d.commission.amount
+                    elif entry_str == "OUT":
+                        calculated += d.profit.amount + d.swap.amount - d.commission.amount
+        except Exception as exc:
+            logger.warning("UserBalanceCheck deal query failed for %s: %s", login, exc)
+
+    stored_bal = Decimal(str(acc.balance.amount))
+    should_fix = bool(fixflag and fixflag.lower() == "true")
+    fixed = False
+    if should_fix and calculated != stored_bal:
+        from core.domains.common.value_objects import Money
+        acc.balance = Money(calculated, acc.currency)
+        await account_repo.save(acc)
+        fixed = True
+
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "Balance check completed",
         "endpoint": "/UserBalanceCheck",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "login": target_login,
+        "current_balance": f"{stored_bal:.2f}",
+        "calculated_balance": f"{calculated:.2f}",
+        "fixed": fixed,
     }
 
 
@@ -1985,34 +2308,35 @@ async def handle_UserDetails_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     login: Optional[str] = Query(None, alias="login", description="Login number"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
     """User details"""
+    res = await _fetch_user_details_list(manager, id, login, account_repo, "/UserDetails")
+    data_list = res.get("data", [])
+    single = data_list[0] if data_list else {}
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "User details retrieved successfully",
         "endpoint": "/UserDetails",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": single,
     }
 
 
-@router.get("/UserDetailsMany", summary="Accounts details. If logins not specifed reutns details for all accoungts.")
-@router_root.get("/UserDetailsMany", summary="Accounts details. If logins not specifed reutns details for all accoungts.")
+@router.get("/UserDetailsMany", summary="Accounts details.")
+@router_root.get("/UserDetailsMany", summary="Accounts details.")
 async def handle_UserDetailsMany_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
-    login: Optional[str] = Query(None, alias="login", description="Login number"),
+    login: Optional[str] = Query(None, alias="login", description="Login number(s)"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Accounts details. If logins not specifed reutns details for all accoungts."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/UserDetailsMany",
-        "data": []
-    }
+    """Accounts details for specified logins or all accounts."""
+    return await _fetch_user_details_list(manager, id, login, account_repo, "/UserDetailsMany")
 
 
-@router.get("/UserDetailsManyPagination", summary="Paginated variant of 'UserDetailsMany' with an optional registration-date filter. Login search works the same way as in 'UserDetailsMany': if logins are not specified, returns all accounts. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server.")
-@router_root.get("/UserDetailsManyPagination", summary="Paginated variant of 'UserDetailsMany' with an optional registration-date filter. Login search works the same way as in 'UserDetailsMany': if logins are not specified, returns all accounts. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server.")
+@router.get("/UserDetailsManyPagination", summary="Paginated variant of 'UserDetailsMany'")
+@router_root.get("/UserDetailsManyPagination", summary="Paginated variant of 'UserDetailsMany'")
 async def handle_UserDetailsManyPagination_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
@@ -2021,14 +2345,12 @@ async def handle_UserDetailsManyPagination_get(
     to_: Optional[str] = Query(None, alias="to", description="Registration date filter, to (server time)"),
     page: Optional[str] = Query(None, alias="page", description="Zero-based page index"),
     pageSize: Optional[str] = Query(None, alias="pageSize", description="Page size, default 100"),
+    account_repo: Any = Depends(get_account_repo),
 ) -> Dict[str, Any]:
-    """Paginated variant of 'UserDetailsMany' with an optional registration-date filter. Login search works the same way as in 'UserDetailsMany': if logins are not specified, returns all accounts. The full result set is cached (sliding TTL), so subsequent pages of the same query do not re-query the server."""
-    return {
-        "retcode": 0,
-        "message": "Success",
-        "endpoint": "/UserDetailsManyPagination",
-        "data": []
-    }
+    """Paginated user details list."""
+    p_num = int(page) if page and str(page).isdigit() else 0
+    s_num = int(pageSize) if pageSize and str(pageSize).isdigit() else 100
+    return await _fetch_user_details_list(manager, id, login, account_repo, "/UserDetailsManyPagination", page=p_num, page_size=s_num)
 
 
 @router.get("/UserGroups", summary="All user groups")
@@ -2037,13 +2359,29 @@ async def handle_UserGroups_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     assignSymbolGroups: Optional[str] = Query(None, alias="assignSymbolGroups", description=""),
+    group_repo: Any = Depends(get_group_repo),
 ) -> Dict[str, Any]:
     """All user groups"""
+    groups_data = []
+    if group_repo is not None:
+        try:
+            groups = await group_repo.get_all_groups()
+            for g in groups:
+                groups_data.append({
+                    "group": g.name,
+                    "currency": g.currency,
+                    "margin_call": f"{g.margin_call:.2f}",
+                    "stop_out": f"{g.margin_stop_out:.2f}",
+                    "leverage": g.default_leverage,
+                })
+        except Exception as exc:
+            logger.exception("UserGroups query failed")
     return {
         "retcode": 0,
-        "message": "Success",
+        "message": "User groups retrieved successfully",
         "endpoint": "/UserGroups",
-        "data": []
+        "id": id or f"session_{manager.login}",
+        "data": groups_data,
     }
 
 

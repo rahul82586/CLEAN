@@ -294,7 +294,7 @@ class Symbol:
             return False  # Only closing allowed
         return True
     
-    def validate_volume(self, volume: Decimal) -> tuple[bool, str]:
+    def validate_volume(self, volume: Any) -> tuple[bool, str]:
         """Validate order volume.
 
         A zero limit means UNSET, not "nothing is allowed". MT5's own exports carry
@@ -307,6 +307,10 @@ class Symbol:
         rather than returning a rejection, which propagated out of CreateOrderHandler as
         an unhandled exception: a 500 instead of a 400, and no rejected-order record.
         """
+        try:
+            volume = Decimal(str(volume))
+        except (ValueError, TypeError, InvalidOperation):
+            return False, f"Invalid volume format: {volume}"
         if volume <= 0:
             return False, f"Volume must be positive, got {volume}"
         if self.volume_min and self.volume_min > 0 and volume < self.volume_min:

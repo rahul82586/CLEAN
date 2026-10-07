@@ -371,22 +371,28 @@ class RecordDealHandler:
             await self._apply_deal_hedging_mode(account, deal, symbol, order=order, position_repo=pos_repo, session=session)
 
     async def _apply_deal_hedging_mode(self, account: Account, deal: Deal, symbol, order=None, position_repo=None, session=None):
-        if order is not None and getattr(order, 'ticket_id', None):
-            position_id = str(order.ticket_id)
-        elif getattr(deal, 'order_id', None):
+        ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
+        deal_tkt = getattr(deal, 'deal_ticket', None) or getattr(deal, 'ticket', None)
+        ord_tkt = getattr(order, 'ticket_id', None) if order is not None else None
+
+        if ord_tkt and str(ord_tkt).isdigit():
+            position_id = str(ord_tkt)
+        elif ext_id and str(ext_id).lstrip("-").isdigit():
+            position_id = str(ext_id)
+        elif deal_tkt and str(deal_tkt).isdigit():
+            position_id = str(deal_tkt)
+        elif getattr(deal, 'order_id', None) and str(deal.order_id).isdigit():
             position_id = str(deal.order_id)
-        elif getattr(deal, 'external_id', None):
-            position_id = str(deal.external_id)
-        elif getattr(deal, 'deal_ticket', None):
-            position_id = str(deal.deal_ticket)
-        elif getattr(deal, 'deal_id', None):
+        elif getattr(deal, 'deal_id', None) and str(deal.deal_id).isdigit():
             position_id = str(deal.deal_id)
         else:
-            entry_msc = int(datetime.now(timezone.utc).timestamp() * 1000)
-            position_id = f"{account.login}_{deal.symbol}_{entry_msc}"
+            # Fallback to a consistent numeric integer ticket
+            fallback_ticket = (uuid.uuid4().int % 900000) + 100000
+            position_id = str(fallback_ticket)
 
         new_position = Position(
             position_id=position_id,
+            external_id=str(ext_id) if ext_id is not None else None,
             account_login=account.login,
             symbol=deal.symbol,
             volume=deal.volume,
@@ -394,9 +400,6 @@ class RecordDealHandler:
             price_open=deal.price,
             contract_size=symbol.contract_size,
             time_create=datetime.now(timezone.utc),
-            # M9: the opening order's SL/TP transfer onto the position. They were
-            # dropped here before - a client's stop existed on the order, never on
-            # the position, and nothing server-side could ever fire it.
             price_sl=order.price_sl if order is not None else None,
             price_tp=order.price_tp if order is not None else None,
         )
@@ -456,6 +459,10 @@ class RecordDealHandler:
                 new_vol = matching_position.volume.value + deal.volume.value
                 matching_position.volume = Volume(new_vol)
                 matching_position.price_open = Price(total_val / new_vol)
+                if not getattr(matching_position, 'external_id', None):
+                    ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
+                    if ext_id is not None:
+                        matching_position.external_id = str(ext_id)
                 if hasattr(pos_repo, 'save') and _accepts_session(pos_repo.save):
                     await pos_repo.save(matching_position, session=session)
                 else:
@@ -503,8 +510,10 @@ class RecordDealHandler:
                     else:
                         position_id = str(getattr(deal, 'deal_ticket', None) or (uuid.uuid4().int % 900000 + 100000))
                     new_vol = deal.volume.value - old_vol
+                    ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
                     new_position = Position(
                         position_id=position_id,
+                        external_id=str(ext_id) if ext_id is not None else None,
                         account_login=account.login,
                         symbol=deal.symbol,
                         volume=Volume(new_vol),
@@ -529,15 +538,19 @@ class RecordDealHandler:
                     position_id = str(deal.deal_id)
                 else:
                     position_id = str(getattr(deal, 'deal_ticket', None) or (uuid.uuid4().int % 900000 + 100000))
+                ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
                 new_position = Position(
                     position_id=position_id,
+                    external_id=str(ext_id) if ext_id is not None else None,
                     account_login=account.login,
                     symbol=deal.symbol,
                     volume=deal.volume,
                     action=deal_side,
                     price_open=deal.price,
                     contract_size=symbol.contract_size,
-                    time_create=datetime.now(timezone.utc)
+                    time_create=datetime.now(timezone.utc),
+                    price_sl=order.price_sl if order is not None else None,
+                    price_tp=order.price_tp if order is not None else None,
                 )
                 if hasattr(pos_repo, 'save') and _accepts_session(pos_repo.save):
                     await pos_repo.save(new_position, session=session)

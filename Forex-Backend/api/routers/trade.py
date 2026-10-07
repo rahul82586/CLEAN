@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
 from api.auth.dependencies import get_current_user
-from api.di_providers import get_create_order_handler
+from api.di_providers import get_create_order_handler, get_order_repo
 from api.schemas.trade import ModifyOrderRequest, OrderRequest, OrderResponse
 from application.commands.cancel_order import CancelOrderCommand
 from application.commands.close_position import ClosePositionCommand
@@ -157,34 +157,74 @@ async def place_order(
         state_str = order.state.value if hasattr(order.state, 'value') else str(order.state)
         created_at = getattr(order, 'created_at', datetime.now(timezone.utc))
 
-        # Order carries volume_initial / volume_current and price_order - MT5's own field
-        # names. This response read `order.filled_volume` and `order.price`, neither of
-        # which exists, so the two guard expressions quietly took their else branch and
-        # EVERY response reported filled_volume 0 and price null, including for orders
-        # that had genuinely filled. A client reading this endpoint could not tell what
-        # it had been filled at, or whether it had been filled at all.
         remaining = order.volume_current.value if hasattr(order.volume_current, 'value') else Decimal('0')
         filled_vol = vol_val - remaining
 
-        # For a market order price_order is the execution price: CreateOrderHandler sets
-        # it from the live quote (ask for a buy, bid for a sell) before the fill, and the
-        # matching engine fills at that same price. For a resting pending order it is the
-        # requested limit/stop, which is the only price there is so far.
         price_val = order.price_order.value if getattr(order, 'price_order', None) else None
+        sl_val = order.price_sl.value if getattr(order, 'price_sl', None) else None
+        tp_val = order.price_tp.value if getattr(order, 'price_tp', None) else None
+        external_id = getattr(order, 'external_id', None)
 
         return OrderResponse(
             ticket_id=str(ticket_id),
+            external_id=str(external_id) if external_id is not None else None,
             symbol=symbol,
             order_type=order_type_str,
             volume=vol_val,
             filled_volume=filled_vol,
             price=price_val,
+            stop_loss=sl_val,
+            take_profit=tp_val,
             state=state_str,
             created_at=created_at,
             message="Order placed successfully"
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    except Exception as e:
+        logger.exception("place_order failed for login %s: %s", command.account_login, e)
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"place_order failed: {e}")
+
+
+@router.get("/orders/{ticket_id}", response_model=OrderResponse)
+async def get_order(
+    ticket_id: str,
+    current_user: Account = Depends(get_current_user),
+    order_repo: Any = Depends(get_order_repo)
+):
+    """Get details of a specific order by its UUID ticket_id or external ticket ID."""
+    login = _login_of(current_user)
+    if order_repo is None:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Order repository unavailable")
+    
+    order = await order_repo.find_by_id(ticket_id)
+    if not order or getattr(order, 'account_login', None) != login:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=f"Order {ticket_id} not found")
+    
+    vol_val = order.volume_initial.value if hasattr(order.volume_initial, 'value') else Decimal(str(order.volume_initial))
+    remaining = order.volume_current.value if hasattr(order.volume_current, 'value') else Decimal('0')
+    filled_vol = vol_val - remaining
+    order_type_str = order.order_type.value if hasattr(order.order_type, 'value') else str(order.order_type)
+    state_str = order.state.value if hasattr(order.state, 'value') else str(order.state)
+    price_val = order.price_order.value if getattr(order, 'price_order', None) else None
+    sl_val = order.price_sl.value if getattr(order, 'price_sl', None) else None
+    tp_val = order.price_tp.value if getattr(order, 'price_tp', None) else None
+    external_id = getattr(order, 'external_id', None)
+
+    return OrderResponse(
+        ticket_id=str(order.ticket_id),
+        external_id=str(external_id) if external_id is not None else None,
+        symbol=order.symbol,
+        order_type=order_type_str,
+        volume=vol_val,
+        filled_volume=filled_vol,
+        price=price_val,
+        stop_loss=sl_val,
+        take_profit=tp_val,
+        state=state_str,
+        created_at=getattr(order, 'created_at', datetime.now(timezone.utc)),
+        message="Order found"
+    )
 
 
 async def _position_repo_volume(handler: Any, position_id: str) -> Optional[Decimal]:
@@ -289,8 +329,19 @@ async def close_position(
     if closed is None:
         closed = (_before - remaining) if _before is not None else remaining
 
+    pos_id_res = str(getattr(position, "position_id", position_id))
+    ext_id_res = getattr(position, "external_id", None)
+    deal_open_res = getattr(position, "deal_open", None)
+    if ext_id_res and str(ext_id_res).lstrip("-").isdigit():
+        pos_id_res = str(ext_id_res)
+    elif (not pos_id_res.isdigit()) and deal_open_res and str(deal_open_res).isdigit():
+        pos_id_res = str(deal_open_res)
+    elif not pos_id_res.isdigit():
+        import zlib
+        pos_id_res = str((zlib.crc32(pos_id_res.encode()) % 900000) + 100000)
+
     return ClosePositionResponse(
-        position_id=str(getattr(position, "position_id", position_id)),
+        position_id=pos_id_res,
         symbol=str(getattr(position, "symbol", "")),
         volume_closed=Decimal(str(closed)),
         volume_remaining=remaining,

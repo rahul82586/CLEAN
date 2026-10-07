@@ -38,9 +38,11 @@ class SqlOrderRepository(IOrderRepository[Order]):
         """
         async def _find(sess: AsyncSession):
             result = await sess.execute(
-                select(OrderModel).where(OrderModel.ticket_id == order_id)
+                select(OrderModel).where(
+                    or_(OrderModel.ticket_id == order_id, OrderModel.external_id == order_id)
+                )
             )
-            model = result.scalar_one_or_none()
+            model = result.scalars().first()
             return db_to_order(model) if model else None
 
         if session is not None:

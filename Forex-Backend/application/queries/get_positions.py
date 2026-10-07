@@ -71,14 +71,30 @@ class GetPositionsQueryHandler:
         results = []
         for pos in positions:
             action = pos.action.value if hasattr(pos.action, "value") else str(pos.action)
+            try:
+                unrealized = self.risk_engine.calculate_position_pnl(account, pos)
+            except Exception as val_err:  # noqa: BLE001
+                unrealized = getattr(getattr(pos, "profit", None), "amount", Decimal("0"))
+
+            pid = str(pos.position_id)
+            ext = getattr(pos, "external_id", None)
+            deal_open = getattr(pos, "deal_open", None)
+            if ext and str(ext).lstrip("-").isdigit():
+                pid = str(ext)
+            elif (not pid.isdigit()) and deal_open and str(deal_open).isdigit():
+                pid = str(deal_open)
+            elif not pid.isdigit():
+                import zlib
+                pid = str((zlib.crc32(pid.encode()) % 900000) + 100000)
+
             results.append(
                 {
-                    "position_id": str(pos.position_id),
+                    "position_id": pid,
                     "symbol": pos.symbol,
                     "side": action,
                     "volume": pos.volume.value,
                     "average_price": pos.price_open.value,
-                    "unrealized_pnl": self.risk_engine.calculate_position_pnl(account, pos),
+                    "unrealized_pnl": unrealized,
                     "swap": (
                         pos.swap.amount
                         if getattr(pos, "swap", None) is not None

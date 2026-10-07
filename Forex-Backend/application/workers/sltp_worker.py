@@ -181,12 +181,16 @@ class SlTpWorker:
                     position.position_id, position.action.name if hasattr(position.action, "name") else position.action,
                     position.symbol, reason, exec_price, "A-BOOK" if ext_id else "B-BOOK",
                 )
-            except Exception:  # noqa: BLE001 - a failed close must not stop the sweep
-                logger.exception(
-                    "%s close FAILED for position %s - the position is still open "
-                    "and still triggering; it will be retried on the next tick",
-                    reason, position.position_id,
-                )
+            except Exception as exc:  # noqa: BLE001 - a failed close must not stop the sweep
+                msg = str(exc).lower()
+                if "already closed" in msg or "not found" in msg:
+                    logger.info("position %s was already closed by another worker/process; skipping duplicate close", position.position_id)
+                else:
+                    logger.exception(
+                        "%s close FAILED for position %s - the position is still open "
+                        "and still triggering; it will be retried on the next tick",
+                        reason, position.position_id,
+                    )
             finally:
                 self._in_flight.discard(position.position_id)
         return closed

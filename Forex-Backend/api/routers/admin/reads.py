@@ -1373,6 +1373,50 @@ async def balance_operation(
     }
 
 
+def balance_operation_payload(op: Any) -> Dict[str, Any]:
+    op_type = op.operation_type.value if hasattr(op.operation_type, "value") else str(op.operation_type)
+    amt = op.amount.amount if hasattr(op.amount, "amount") else op.amount
+    bal_after = op.balance_after.amount if hasattr(op.balance_after, "amount") else op.balance_after
+    currency = op.amount.currency if hasattr(op.amount, "currency") else "USD"
+    created = op.created_at.isoformat() if hasattr(op.created_at, "isoformat") else str(op.created_at)
+
+    return {
+        "operation_id": str(getattr(op, "operation_id", "")),
+        "login": str(getattr(op, "account_login", "")),
+        "operation": op_type,
+        "operation_type": op_type,
+        "amount": str(amt),
+        "currency": currency,
+        "balance_after": str(bal_after),
+        "reference_id": getattr(op, "reference_id", None),
+        "comment": getattr(op, "comment", None),
+        "created_at": created,
+    }
+
+
+@funds_router.get("/{login}/balance")
+async def get_balance_operations(
+    login: str,
+    account_repo: Any = Depends(get_account_repo),
+    ledger_repo: Any = Depends(get_ledger_repo),
+) -> List[Dict[str, Any]]:
+    """List historical balance operations (deposits, withdrawals, credits) for an account."""
+    if ledger_repo is None:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Ledger repository is not wired")
+
+    target_login = str(login)
+    fn = getattr(ledger_repo, "get_by_account", None) or getattr(ledger_repo, "find_by_account", None)
+    if not fn:
+        return []
+
+    ops = await fn(target_login)
+    if not ops and target_login.isdigit():
+        ops = await fn(int(target_login))
+
+    return [balance_operation_payload(op) for op in (ops or [])]
+
+
+
 
 # ---------------------------------------------------------------------------
 # holidays (B11) - the command and repo existed with ZERO routes
