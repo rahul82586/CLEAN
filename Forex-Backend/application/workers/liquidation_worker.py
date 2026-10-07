@@ -136,13 +136,14 @@ class LiquidationWorker:
         self._task: Optional[asyncio.Task] = None
     
     async def start(self) -> None:
-        """Start the worker and subscribe to StopOutEntered events."""
+        """Start the worker, subscribe to StopOutEntered events, and start safety poll loop."""
         if self._running:
             return
         
         self._running = True
         self.event_bus.subscribe(StopOutEntered, self._on_stop_out_entered)
-        logger.info("LiquidationWorker started and subscribed to StopOutEntered events")
+        self._task = asyncio.create_task(self._poll_loop())
+        logger.info("LiquidationWorker started, subscribed to StopOutEntered events, and polling loop running")
     
     async def stop(self) -> None:
         """Stop the worker and unsubscribe from events."""
@@ -151,7 +152,34 @@ class LiquidationWorker:
         
         self._running = False
         self.event_bus.unsubscribe(StopOutEntered, self._on_stop_out_entered)
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
         logger.info("LiquidationWorker stopped")
+
+    async def _poll_loop(self) -> None:
+        """Periodic safety poll: checks database for accounts in STOP_OUT state."""
+        while self._running:
+            try:
+                await asyncio.sleep(5)
+                if not self._running:
+                    break
+                finder = getattr(self.account_repo, "find_page", None)
+                if finder is not None:
+                    try:
+                        rows, _ = await finder(so_active=True, limit=100)
+                        for acc in rows:
+                            so_val = getattr(acc.so_activation, "value", acc.so_activation)
+                            so_name = str(getattr(acc.so_activation, "name", acc.so_activation)).upper()
+                            if so_val == 2 or so_name == "STOP_OUT":
+                                logger.warning(f"Stop-out poll found account {acc.login} in STOP_OUT state")
+                                await self._execute_liquidation(acc.login)
+                    except Exception as poll_err:
+                        logger.error(f"Error in LiquidationWorker poll check: {poll_err}")
+            except asyncio.CancelledError:
+                break
+            except Exception as loop_err:
+                logger.error(f"Error in LiquidationWorker poll loop: {loop_err}")
     
     async def _on_stop_out_entered(self, event: StopOutEntered) -> None:
         # The margin level that TRIGGERED this stop-out, used for MT5's "[so XX%]" deal

@@ -317,19 +317,49 @@ async def config_status(
     symbols cannot trade, and before M2 there was no way to tell the difference between
     "seeded" and "empty" without reading the database by hand.
     """
-    groups = await _require(group_repo, "group").get_all()
-    symbols = await _require(symbol_repo, "symbol").get_all_symbols()
-    accounts = await _require(account_repo, "account").find_all()
+    # Counts, not rows.
+    #
+    # This endpoint used to call get_all() / get_all_symbols() / find_all() and take len() of each.
+    # Measured at 494 ms median (764 ms max) against 16-55 ms for every other endpoint the GUI polls,
+    # which is what made Market Watch feel slow.
+    #
+    # find_all() is the worst offender: account_repository.py runs one extra group SELECT PER ACCOUNT
+    # (N+1) while building objects this endpoint then throws away. get_all_symbols() hydrates 362
+    # Symbol objects to return one integer.
+    #
+    # `count_*` is a single indexed aggregate, constructs no ORM entity, and cannot trigger the N+1
+    # because no row is loaded. Reached by getattr because these repositories have several
+    # implementations and the port deliberately does not mandate it; anything without the fast path
+    # falls back to the original fetch-and-count, so the answer is identical either way.
+    async def _count(repo: Any, fast: str, slow: str) -> int:
+        fn = getattr(repo, fast, None)
+        if fn is not None:
+            try:
+                return int(await fn())
+            except Exception as exc:  # noqa: BLE001 - fall back, never fail the endpoint
+                print(f"[admin/status] count via {fast} failed ({exc}); counting in Python")
+        return len(await getattr(repo, slow)())
 
+    groups_repo = _require(group_repo, "group")
+    symbols_repo = _require(symbol_repo, "symbol")
+    accounts_repo = _require(account_repo, "account")
+
+    n_groups = await _count(groups_repo, "count_groups", "get_all")
+    n_symbols = await _count(symbols_repo, "count_symbols", "get_all_symbols")
+    n_accounts = await _count(accounts_repo, "count_accounts", "find_all")
+
+    # The three predicates need NAMES, not rows, so groups are still listed - they are the smallest
+    # table of the three and carry no per-row joins.
+    groups = await groups_repo.get_all()
     group_names = {g.name for g in groups}
     return {
-        "groups": len(groups),
-        "symbols": len(symbols),
-        "accounts": len(accounts),
+        "groups": n_groups,
+        "symbols": n_symbols,
+        "accounts": n_accounts,
         "has_real_group": any(n.startswith("real" + chr(92)) for n in group_names),
         "has_demo_group": any(n.startswith("demo" + chr(92)) for n in group_names),
         "has_coverage_group": "coverage" + chr(92) + "house" in group_names,
-        "ready_to_trade": bool(groups) and bool(symbols),
+        "ready_to_trade": bool(n_groups) and bool(n_symbols),
     }
 
 # ---------------------------------------------------------------------------

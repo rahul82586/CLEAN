@@ -228,6 +228,27 @@ def test_insufficient_margin_over_http_is_a_400(client_and_harness):
     assert account_of(harness).margin_used.amount == Decimal("0")
 
 
+def test_get_order_by_ticket_id(client_and_harness):
+    """GET /api/v1/trade/orders/{ticket_id} reads back a placed order."""
+    client, harness, app = client_and_harness
+    install_tick(harness, "EURUSD", BID, ASK)
+
+    place_res = place(
+        client,
+        {"symbol": "EURUSD", "order_type": "BUY_LIMIT", "volume": "0.10", "price": "1.09000"},
+    )
+    assert place_res.status_code == 200, place_res.text
+    ticket_id = place_res.json()["ticket_id"]
+
+    get_res = client.get(f"/api/v1/trade/orders/{ticket_id}", headers=auth_headers(DEFAULT_LOGIN))
+    assert get_res.status_code == 200, get_res.text
+    data = get_res.json()
+    assert data["ticket_id"] == ticket_id
+    assert data["symbol"] == "EURUSD"
+    assert data["order_type"] == "BUY_LIMIT"
+    assert data["state"] == "PLACED"
+
+
 def test_module_level_app_boots_with_a_default_container():
     """`uvicorn api.main:app` must produce a server, not a KeyError at startup.
 

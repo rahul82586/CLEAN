@@ -21,6 +21,8 @@ from api.di_providers import (
     get_deal_repo,
     get_symbol_repo,
     get_risk_engine,
+    get_close_position_handler,
+    get_cancel_order_handler,
 )
 
 logger = logging.getLogger(__name__)
@@ -797,15 +799,72 @@ async def handle_OrderCloseAll_get(
     manager: Account = Depends(get_current_manager),
     id: Optional[str] = Query(None, alias="id", description="Token returned by 'Connect' method"),
     logins: Optional[str] = Query(None, alias="logins", description="Accounts list"),
+    position_repo: Any = Depends(get_position_repo),
+    close_handler: Any = Depends(get_close_position_handler),
+    order_repo: Any = Depends(get_order_repo),
+    cancel_handler: Any = Depends(get_cancel_order_handler),
 ) -> Dict[str, Any]:
-    """Close all market or pending orders"""
+    """Close all market or pending orders for specified logins (or all accounts)."""
+    login_list = [int(x.strip()) for x in logins.split(",") if x.strip().isdigit()] if logins and logins != "*" else []
+    closed_count = 0
+    cancelled_count = 0
+
+    # 1. Close open positions
+    try:
+        if login_list:
+            positions_to_close = []
+            for l in login_list:
+                acc_pos = await position_repo.get_positions_by_account(l)
+                positions_to_close.extend([p for p in acc_pos if getattr(p, "time_done", None) is None])
+        else:
+            all_pos = await position_repo.get_open_positions()
+            positions_to_close = [p for p in all_pos if getattr(p, "time_done", None) is None]
+
+        for pos in positions_to_close:
+            try:
+                from application.commands.close_position import ClosePositionCommand
+                await close_handler.handle(ClosePositionCommand(
+                    account_login=int(pos.account_login),
+                    position_id=str(pos.position_id),
+                    comment="OrderCloseAll",
+                    reason="DEALER",
+                ))
+                closed_count += 1
+            except Exception as exc:
+                logger.warning("OrderCloseAll could not close position %s: %s", getattr(pos, "position_id", "?"), exc)
+    except Exception as exc:
+        logger.error("OrderCloseAll position query failed: %s", exc)
+
+    # 2. Cancel active pending orders
+    try:
+        raw_orders, _ = await order_repo.find_page(limit=1000, offset=0, history=False)
+        for o in raw_orders:
+            acc_login = int(o.account_login)
+            if login_list and acc_login not in login_list:
+                continue
+            state_str = o.state.name if hasattr(o.state, "name") else str(o.state)
+            if state_str in ("NEW", "PLACED", "0", "1"):
+                try:
+                    from application.commands.cancel_order import CancelOrderCommand
+                    await cancel_handler.handle(CancelOrderCommand(
+                        account_login=acc_login,
+                        order_id=str(o.ticket_id),
+                        reason="DEALER",
+                    ))
+                    cancelled_count += 1
+                except Exception as exc:
+                    logger.warning("OrderCloseAll could not cancel order %s: %s", getattr(o, "ticket_id", "?"), exc)
+    except Exception as exc:
+        logger.error("OrderCloseAll order query failed: %s", exc)
+
     return {
         "retcode": 0,
-        "message": "All orders closed successfully",
+        "message": f"Closed {closed_count} position(s) and cancelled {cancelled_count} order(s)",
         "endpoint": "/OrderCloseAll",
         "id": id or f"session_{manager.login}",
         "logins": logins or "*",
-        "closed_count": 1,
+        "closed_count": closed_count,
+        "cancelled_count": cancelled_count,
     }
 
 

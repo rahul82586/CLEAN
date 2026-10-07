@@ -37,11 +37,14 @@ class OrderRequest(BaseModel):
 class OrderResponse(BaseModel):
     """Response returned after order placement or query."""
     ticket_id: str
+    external_id: Optional[str] = None
     symbol: str
     order_type: str
     volume: Decimal
     filled_volume: Decimal
-    price: Optional[Decimal]
+    price: Optional[Decimal] = None
+    stop_loss: Optional[Decimal] = None
+    take_profit: Optional[Decimal] = None
     state: str
     created_at: datetime
     message: Optional[str] = None

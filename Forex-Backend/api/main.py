@@ -335,6 +335,38 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
     
     async def startup_event(app: FastAPI):
         try:
+            # ------------------------------------------------------------------
+            # PROCESS ROLE - which plane does THIS process own?
+            #
+            #   core   (default) trading plane + market data plane + workers
+            #   client           API only. No tick pipeline, no workers.
+            #
+            # Every process built the SAME stack, so one started as `--port 8002`
+            # for retail clients also ran a TickMarginPipeline: it subscribed to
+            # TICK_RECEIVED and did a database read-modify-write per position per
+            # tick, against the same account rows the core process was writing.
+            #
+            # Two live consequences, both observed rather than inferred:
+            #   * StopOutEntered was published into a per-process InProcessEventBus,
+            #     which cannot cross a process boundary, so the LiquidationWorker in
+            #     the other process never woke. An account was seen at 12.78% margin
+            #     level - its stop-out is 25% - with its position open and no
+            #     liquidation, for as long as the condition held.
+            #   * two pipelines wrote the same rows from two different reads.
+            #
+            # Only the process owning the trading plane needs to value positions.
+            # The default stays `core`, so a process started without the variable
+            # behaves exactly as today - nothing silently stops valuing positions
+            # because an env var was forgotten.
+            _PROCESS_ROLE = os.environ.get("PROCESS_ROLE", "core").strip().lower()
+            _RUNS_MARKET_DATA = _PROCESS_ROLE != "client"
+            logger.info(
+                "PROCESS_ROLE=%s -> this process %s the market data plane "
+                "(tick pipeline + margin/liquidation/SLTP workers)",
+                _PROCESS_ROLE,
+                "RUNS" if _RUNS_MARKET_DATA else "SKIPS",
+            )
+
             # 1. Initialize ConfigCache (MT5-like speed)
             logger.info("Initializing ConfigCache from PostgreSQL...")
             container = get_di_container()
@@ -580,9 +612,17 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
             try:
                 from application.di.market_data_setup import build_market_data_stack
 
-                md_components = build_market_data_stack(container)
-                app.state.tick_pipeline = md_components.get("tick_pipeline")
-                logger.info("✅ TickMarginPipeline subscribed to TICK_RECEIVED")
+                if not _RUNS_MARKET_DATA:
+                    logger.info(
+                        "PROCESS_ROLE=client: skipping the market data plane. The core "
+                        "process owns the tick pipeline; a second one would re-value "
+                        "the same positions on every tick."
+                    )
+                    md_components = {}
+                else:
+                    md_components = build_market_data_stack(container)
+                    app.state.tick_pipeline = md_components.get("tick_pipeline")
+                    logger.info("✅ TickMarginPipeline subscribed to TICK_RECEIVED")
             except Exception as exc:  # noqa: BLE001 - reported, not fatal to the API
                 logger.error(
                     "market data stack could not be assembled: %s. Orders will still "

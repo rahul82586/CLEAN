@@ -8,6 +8,7 @@ Mirrors MT5's IMTTickSink -> IMTAccountSink flow.
 """
 import asyncio
 import logging
+import os
 from decimal import Decimal
 from typing import Any, Dict, List, Set
 from datetime import datetime, timezone
@@ -65,6 +66,22 @@ class TickMarginPipeline:
         self.coalesce_seconds = max(0.0, float(coalesce_seconds))
         self._pending: Dict[str, Any] = {}
         self._flush_tasks: Dict[str, Any] = {}
+        #: Option A: how long a per-account position re-read is reused, in seconds.
+        #:
+        #: This is a READ cache, not a write deferral. Positions and the account row
+        #: are still written on every tick, so `SlTpWorker` (which reads positions) and
+        #: `LiquidationWorker` (which polls `accounts.so_activation`) see the same
+        #: numbers at the same moment as before.
+        #:
+        #: What it saves is the `get_by_account` call per account per tick, whose
+        #: only purpose is to re-sum PnL. A position's stored figure for a symbol
+        #: that has not ticked is that symbol's own last tick's value, so reusing it
+        #: for a second cannot change the total - only how often it is read.
+        self.account_read_cache_seconds = max(
+            0.0, float(os.environ.get("ACCOUNT_READ_CACHE_SECONDS", "1") or 0)
+        )
+        self._account_positions_cache: Dict[str, Any] = {}
+        self._account_positions_cached_at: Dict[str, float] = {}
         self._warned_full_row_save = False
 
     async def process_tick(self, tick: Tick) -> None:
@@ -244,7 +261,28 @@ class TickMarginPipeline:
             # Get ALL positions for this account (not just the current symbol),
             # then replace the ones this tick repriced with the objects that hold
             # the new numbers.
-            fetched = await self.position_repo.get_by_account(login)
+            # Option A: cache this per-account re-read.
+            #
+            # One statement per ACCOUNT, per TICK, used only to re-sum PnL. The positions of
+            # the symbol that just ticked are already in `repriced`; the rest are read purely
+            # to obtain what each of those symbols' own last ticks already stored - so the
+            # total is identical, only the fetch is less frequent.
+            #
+            # NOT cached, on purpose: the position WRITE in step 4 (a tick that computes PnL
+            # and does not persist it was a real defect, D13) and the account WRITE in step 5
+            # (`LiquidationWorker` polls `accounts.so_activation` from the database, so
+            # deferring it delays a stop-out). No write is deferred by this change.
+            _now = asyncio.get_event_loop().time()
+            _cached_at = self._account_positions_cached_at.get(login)
+            fetched = self._account_positions_cache.get(login)
+            if (
+                fetched is None
+                or _cached_at is None
+                or (_now - _cached_at) >= self.account_read_cache_seconds
+            ):
+                fetched = await self.position_repo.get_by_account(login)
+                self._account_positions_cache[login] = fetched
+                self._account_positions_cached_at[login] = _now
             seen = {x.position_id for x in fetched}
             all_positions = [repriced.get(x.position_id, x) for x in fetched]
             # A position this tick repriced that the account read did not return

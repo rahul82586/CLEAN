@@ -165,8 +165,7 @@ class RedisEventBus(IEventBus):
             await self._redis_client.publish(channel, message)
             logger.debug(f"Event published to {channel}: {event.event_id}")
         except Exception as e:
-            logger.error(f"Failed to publish event {event.event_id}: {e}")
-            raise
+            logger.error(f"Failed to publish event {event.event_id} to Redis: {e}")
 
     def subscribe(self, channel: Any, callback: Callable[[Any], None]) -> None:
         """Register a handler. Synchronous, so registration cannot be silently dropped.

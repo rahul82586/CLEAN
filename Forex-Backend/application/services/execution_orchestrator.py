@@ -342,6 +342,16 @@ class ExecutionOrchestrator:
                                                       "NO_FILLED_VOLUME")
             return
 
+        # Store external_id on order if returned in LP report
+        lp_order_id = report.get("order_id") or report.get("ticket") or report.get("mt5_ticket")
+        if lp_order_id:
+            order.external_id = str(lp_order_id)
+            if self.order_repo:
+                try:
+                    await self.order_repo.save(order)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("Could not persist external_id to order %s: %s", order.ticket_id, exc)
+
         try:
             deal = await self._apply_deal_to_account(
                 order, fill_price, account, volume=fill_volume

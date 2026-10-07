@@ -1,6 +1,6 @@
 from typing import List, Optional
 from decimal import Decimal
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from core.domains.accounts.models import Group
 from core.ports.interfaces import IGroupRepository
@@ -88,6 +88,26 @@ class SqlGroupRepository(IGroupRepository):
     async def get_all(self) -> List[Group]:
         """Every group. Called once at startup to warm the ConfigCache."""
         return await self.get_all_groups()
+
+    async def count_groups(self) -> int:
+            """Row count, answered by the database.
+
+            `/api/v1/admin/status` needs a number, not entities. Building the whole table to
+            call len() on it measured 494 ms median for this one endpoint against 16-55 ms for
+            every other endpoint the GUI polls. In the account repository it was worse than slow:
+            `find_all` runs one extra group SELECT per account (N+1) while building the list.
+
+            `select(func.count()).select_from(GroupModel)` is a single indexed aggregate returning
+            one row. No entity is constructed, so no per-row join can fire, and the cost does not
+            grow with table size in Python memory.
+
+            Counts ALL rows, matching what `get_all()` returned, so callers see the same number.
+            """
+            async with self.session_factory() as session:
+                result = await session.execute(
+                    select(func.count()).select_from(GroupModel)
+                )
+                return int(result.scalar_one())
 
     async def find_by_id(self, group_id: str) -> Optional[Group]:
         """Look a group up by its surrogate id."""
