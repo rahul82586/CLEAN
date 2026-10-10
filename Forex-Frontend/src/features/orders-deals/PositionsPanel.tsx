@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { API, isBackendGap, TradeRequest } from '../../services/api';
+import { wsStreamService } from '../../services/api/ticksStream';
 import { RequestBar } from './RequestBar';
 import { OperationDialog } from './OperationDialog';
 import type { OperationKind } from '../../services/api';
@@ -13,6 +14,7 @@ import { money } from '../../shared/format';
 export function PositionsPanel(): React.ReactElement {
     const [rows, setRows] = React.useState<any[]>([]);
     const [symbols, setSymbols] = React.useState<string[]>([]);
+    const [symbolMap, setSymbolMap] = React.useState<Record<string, any>>({});
     const [loading, setLoading] = React.useState(true);
     const [banner, setBanner] = React.useState<{ gap: boolean; text: string } | null>(null);
 
@@ -24,11 +26,24 @@ export function PositionsPanel(): React.ReactElement {
     const [to, setTo] = React.useState('');
 
     React.useEffect(() => {
-        API.getSymbols().then((s) => setSymbols(s.map((x: any) => x.symbol ?? x.name))).catch(() => setSymbols([]));
+        API.getSymbols().then((sList) => {
+            const map: Record<string, any> = {};
+            const names: string[] = [];
+            for (const s of sList) {
+                const symName = s.name || (s.symbol ? s.symbol.split('\\').pop() : '');
+                if (symName) {
+                    map[symName] = s;
+                    map[s.symbol] = s;
+                }
+                names.push(s.symbol ?? s.name);
+            }
+            setSymbolMap(map);
+            setSymbols(names);
+        }).catch(() => setSymbols([]));
     }, []);
 
-    const request = React.useCallback(async () => {
-        setLoading(true);
+    const request = React.useCallback(async (isInitial = false) => {
+        if (isInitial) setLoading(true);
         setBanner(null);
         const req: TradeRequest = {
             mask,
@@ -38,18 +53,79 @@ export function PositionsPanel(): React.ReactElement {
             to: to ? new Date(to).toISOString() : undefined,
         };
         try {
-            setRows(await API.getPositions(req));
+            const fetched = await API.getPositions(req);
+            setRows(prevRows => {
+                if (!prevRows || prevRows.length === 0) return fetched;
+                const prevMap: Record<string, any> = {};
+                prevRows.forEach(p => { prevMap[p.position_id] = p; });
+
+                return fetched.map(p => {
+                    const prev = prevMap[p.position_id];
+                    if (prev && prev.price_current != null && !p.is_closed) {
+                        return {
+                            ...p,
+                            price_current: prev.price_current,
+                            profit: prev.profit,
+                        };
+                    }
+                    return p;
+                });
+            });
         } catch (e: any) {
             setBanner({ gap: isBackendGap(e), text: String(e?.message ?? e) });
-            setRows([]);
         } finally {
-            setLoading(false);
+            if (isInitial) setLoading(false);
         }
     }, [mask, symbol, openOnly, from, to]);
 
     React.useEffect(() => {
-        void request();
+        void request(true);
+        const iv = setInterval(() => void request(false), 5000);
+        return () => clearInterval(iv);
     }, [request]);
+
+    // Realtime MT5 Position Revaluation: revalues open positions & PnL instantly on every tick using symbol metadata
+    React.useEffect(() => {
+        const unsubscribe = wsStreamService.subscribeTicks((ticks) => {
+            setRows((prevRows) => {
+                if (!prevRows || prevRows.length === 0) return prevRows;
+                let changed = false;
+
+                const updated = prevRows.map((p) => {
+                    if (p.is_closed) return p;
+                    const sym = p.symbol ? (p.symbol.includes('\\') ? p.symbol.split('\\').pop() : p.symbol) : '';
+                    const tick = ticks[p.symbol] || (sym ? ticks[sym] : undefined);
+                    if (!tick) return p;
+
+                    const isBuy = p.type === 0 || String(p.type).toLowerCase() === 'buy';
+                    const currentPrice = isBuy ? tick.bid : tick.ask;
+                    if (currentPrice == null || !Number.isFinite(currentPrice)) return p;
+
+                    // Exact contract_size lookup from symbol metadata (e.g. 100 for XAUUSD, 100000 for EURUSD, 1 for BTCUSD)
+                    const meta = symbolMap[p.symbol] || (sym ? symbolMap[sym] : undefined);
+                    const contractSize = Number(meta?.contract_size ?? p.contract_size ?? 100000);
+                    const openPrice = Number(p.price_open ?? 0);
+                    const vol = Number(p.volume ?? 0);
+
+                    const diff = isBuy ? (currentPrice - openPrice) : (openPrice - currentPrice);
+                    const newProfit = diff * vol * contractSize;
+
+                    if (p.price_current === currentPrice && Math.abs((p.profit ?? 0) - newProfit) < 0.001) return p;
+
+                    changed = true;
+                    return {
+                        ...p,
+                        price_current: currentPrice,
+                        profit: Math.round(newProfit * 100) / 100,
+                    };
+                });
+
+                return changed ? updated : prevRows;
+            });
+        });
+
+        return () => unsubscribe();
+    }, [symbolMap]);
 
     return (
         <div className="ca-page">

@@ -117,10 +117,16 @@ export function resolveTreeNode(rawNodeId: string, label?: string): ResolvedPane
     } else if (nodeId.startsWith('symbols:')) {
         nodeId = 'symbols';
         filterPath = rawNodeId.substring('symbols:'.length);
+    } else if (nodeId.startsWith('gateways:')) {
+        nodeId = 'gateways';
+        filterPath = rawNodeId.substring('gateways:'.length);
     }
 
     const props: Record<string, unknown> = {};
-    if (filterPath) props.selectedPath = filterPath;
+    if (filterPath) {
+        if (nodeId === 'gateways') props.selectedGatewayId = filterPath;
+        else props.selectedPath = filterPath;
+    }
 
     // Multi-instance support: every time Trade Terminal is opened, generate a unique panel instance
     if (nodeId === 'trade-panel' || nodeId.startsWith('trade-panel')) {
@@ -186,12 +192,9 @@ export function resolveTreeNode(rawNodeId: string, label?: string): ResolvedPane
             break;
         case 'gateways':
         case 'gateways.list':
-            defId = 'gateways';
-            props.view = 'list';
-            break;
         case 'gateways.routing':
             defId = 'gateways';
-            props.view = 'routing';
+            title = 'Gateways';
             break;
         case 'data-feeds':
         case 'data-feeds.sources':
@@ -245,6 +248,7 @@ export function resolveTreeNode(rawNodeId: string, label?: string): ResolvedPane
 export function normalizePanelId(rawNodeId: string): string {
     if (rawNodeId.startsWith('groups:')) return 'groups';
     if (rawNodeId.startsWith('symbols:')) return 'symbols';
+    if (rawNodeId.startsWith('gateways:')) return 'gateways';
     if (rawNodeId === 'trade-panel') {
         return `trade-panel-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     }

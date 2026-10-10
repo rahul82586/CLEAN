@@ -255,7 +255,17 @@ class RecordDealHandler:
         deal_currency = getattr(account, "currency", None) or "USD"
 
         # 3. Create Immutable Deal Entity
-        deal_id = str(uuid.uuid4())
+        deal_id = getattr(command, "deal_id", None)
+        if not deal_id:
+            try:
+                import time
+                from api.routers.manager.trading import get_next_deal_ticket
+                deal_ticket = await get_next_deal_ticket(deal_repo)
+                deal_id = str(deal_ticket)
+            except Exception:
+                import time
+                deal_id = str(int(time.time() * 1000) % 900000 + 100000)
+
         deal = Deal(
             deal_id=deal_id,
             order_id=command.order_id,
@@ -501,16 +511,20 @@ class RecordDealHandler:
                         account, deal, opp_pos, symbol, old_vol, session=session
                     )
                     await self._mark_closed(pos_repo, opp_pos, deal, session=session)
-                    if order is not None and getattr(order, 'ticket_id', None):
+                    ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
+                    if order is not None and getattr(order, 'ticket_id', None) and str(order.ticket_id).isdigit():
                         position_id = str(order.ticket_id)
-                    elif getattr(deal, 'order_id', None):
+                    elif ext_id and str(ext_id).lstrip("-").isdigit():
+                        position_id = str(ext_id)
+                    elif getattr(deal, 'order_id', None) and str(deal.order_id).isdigit():
                         position_id = str(deal.order_id)
                     elif getattr(deal, 'deal_id', None) and str(deal.deal_id).isdigit():
                         position_id = str(deal.deal_id)
+                    elif getattr(deal, 'deal_ticket', None) and str(deal.deal_ticket).isdigit():
+                        position_id = str(deal.deal_ticket)
                     else:
-                        position_id = str(getattr(deal, 'deal_ticket', None) or (uuid.uuid4().int % 900000 + 100000))
+                        position_id = str((uuid.uuid4().int % 900000) + 100000)
                     new_vol = deal.volume.value - old_vol
-                    ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
                     new_position = Position(
                         position_id=position_id,
                         external_id=str(ext_id) if ext_id is not None else None,
@@ -530,15 +544,19 @@ class RecordDealHandler:
                         await pos_repo.save(new_position)
                     logger.debug(f"Position reversed (Netting)")
             else:
-                if order is not None and getattr(order, 'ticket_id', None):
+                ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
+                if order is not None and getattr(order, 'ticket_id', None) and str(order.ticket_id).isdigit():
                     position_id = str(order.ticket_id)
-                elif getattr(deal, 'order_id', None):
+                elif ext_id and str(ext_id).lstrip("-").isdigit():
+                    position_id = str(ext_id)
+                elif getattr(deal, 'order_id', None) and str(deal.order_id).isdigit():
                     position_id = str(deal.order_id)
                 elif getattr(deal, 'deal_id', None) and str(deal.deal_id).isdigit():
                     position_id = str(deal.deal_id)
+                elif getattr(deal, 'deal_ticket', None) and str(deal.deal_ticket).isdigit():
+                    position_id = str(deal.deal_ticket)
                 else:
-                    position_id = str(getattr(deal, 'deal_ticket', None) or (uuid.uuid4().int % 900000 + 100000))
-                ext_id = getattr(order, 'external_id', None) or getattr(deal, 'external_id', None)
+                    position_id = str((uuid.uuid4().int % 900000) + 100000)
                 new_position = Position(
                     position_id=position_id,
                     external_id=str(ext_id) if ext_id is not None else None,

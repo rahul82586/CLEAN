@@ -67,7 +67,7 @@ class AuthService:
         if self._password_hasher:
             if self._password_hasher.verify_password(password, account.password_hash):
                 is_valid = True
-            elif account.investor_password_hash and self._password_hasher.verify_password(password, account.investor_password_hash):
+            elif getattr(account, "investor_password_hash", None) and self._password_hasher.verify_password(password, account.investor_password_hash):
                 is_valid = True
         else:
             if getattr(account, "password_hash", None) == password or getattr(account, "investor_password_hash", None) == password:

@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { API } from '../../services/api';
+import { wsStreamService } from '../../services/api/ticksStream';
 import './trade-panel.css';
 
 interface Props {
@@ -140,47 +141,14 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
         }
     }, [selectedLogin]);
 
-    // 2. Fetch Live Quotes & Open Positions/Orders
+    // 2. Fetch Live Quotes & Open Positions/Orders via background sync
     const refreshData = React.useCallback(async () => {
         try {
-            const [ticksData, posData, ordData] = await Promise.all([
-                API.getTicks().catch(() => ({})),
+            const [posData, ordData] = await Promise.all([
                 API.getPositions({ openOnly: true }).catch(() => []),
                 API.getOrders({ openOnly: true }).catch(() => []),
             ]);
 
-            // Update Quotes
-            if (ticksData && typeof ticksData === 'object') {
-                const nextQuotes: Record<string, { bid: number; ask: number; spread: number }> = {};
-                for (const [k, v] of Object.entries(ticksData as Record<string, any>)) {
-                    nextQuotes[k.toUpperCase()] = {
-                        bid: Number(v.bid || 0),
-                        ask: Number(v.ask || 0),
-                        spread: Number(v.spread || 0),
-                    };
-                }
-                setQuotes(nextQuotes);
-
-                // Check flash for selected symbol
-                const cur = nextQuotes[selectedSymbol.toUpperCase()];
-                if (cur && prevQuoteRef.current) {
-                    if (cur.bid > prevQuoteRef.current.bid) setFlashBid('up');
-                    else if (cur.bid < prevQuoteRef.current.bid) setFlashBid('down');
-
-                    if (cur.ask > prevQuoteRef.current.ask) setFlashAsk('up');
-                    else if (cur.ask < prevQuoteRef.current.ask) setFlashAsk('down');
-
-                    setTimeout(() => {
-                        setFlashBid(null);
-                        setFlashAsk(null);
-                    }, 400);
-                }
-                if (cur) {
-                    prevQuoteRef.current = cur;
-                }
-            }
-
-            // Update Positions & Orders
             if (Array.isArray(posData)) {
                 setPositions(posData);
             }
@@ -190,9 +158,53 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
         } catch (err) {
             console.error('TradePanel refreshData error', err);
         }
+    }, []);
+
+    // Realtime WebSocket tick stream subscription for zero-latency TradePanel quotes
+    React.useEffect(() => {
+        const unsubscribe = wsStreamService.subscribeTicks((incomingTicks) => {
+            setQuotes(prev => {
+                const nextQuotes = { ...prev };
+                for (const [sym, tick] of Object.entries(incomingTicks)) {
+                    if (tick.bid != null && tick.ask != null) {
+                        const key = sym.toUpperCase();
+                        nextQuotes[key] = {
+                            bid: Number(tick.bid),
+                            ask: Number(tick.ask),
+                            spread: tick.spread != null ? Number(tick.spread) : Number((tick.ask - tick.bid).toFixed(5)),
+                        };
+                    }
+                }
+
+                // Check flash for selected symbol
+                const cur = nextQuotes[selectedSymbol.toUpperCase()];
+                if (cur && prevQuoteRef.current) {
+                    if (cur.bid > prevQuoteRef.current.bid) setFlashBid('up');
+                    else if (cur.bid < prevQuoteRef.current.bid) setFlashBid('down');
+
+                    if (cur.ask > prevQuoteRef.current.ask) setFlashAsk('up');
+                    else if (cur.ask < prevQuoteRef.current.ask) setFlashAsk('down');
+                }
+                if (cur) {
+                    prevQuoteRef.current = cur;
+                }
+
+                return nextQuotes;
+            });
+        });
+
+        const flashIv = setInterval(() => {
+            setFlashBid(null);
+            setFlashAsk(null);
+        }, 400);
+
+        return () => {
+            unsubscribe();
+            clearInterval(flashIv);
+        };
     }, [selectedSymbol]);
 
-    // Auto-refresh loop
+    // Auto-refresh loop for positions & orders (5s)
     React.useEffect(() => {
         loadMetadata();
         refreshData();
@@ -202,7 +214,7 @@ export function TradePanel({ instanceId, setTitle }: Props): React.ReactElement 
         if (!autoRefresh) return;
         const interval = setInterval(() => {
             refreshData();
-        }, 2000);
+        }, 5000);
         return () => clearInterval(interval);
     }, [autoRefresh, refreshData]);
 

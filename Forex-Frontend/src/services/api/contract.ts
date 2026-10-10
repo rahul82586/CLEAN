@@ -71,12 +71,13 @@ export interface RoutingRulePayload {
 
 export interface GatewayPayload {
     name: string;
-    type: string;
+    type?: string;
     host?: string;
     port?: number;
     username?: string;
     api_key?: string;
     is_active?: boolean;
+    [key: string]: any;
 }
 
 export interface GroupSymbolOverridePayload {
@@ -203,6 +204,7 @@ export interface AdminApi {
     getGateways(): Promise<any[]>;
     createGateway(data: GatewayPayload): Promise<any>;
     updateGateway(id: number, data: any): Promise<any>;
+    deleteGateway(id: number): Promise<any>;
     testGateway(id: number): Promise<any>;
 
     // Market data

@@ -18,6 +18,7 @@ from core.domains.market_data.quote_freshness import (
 from core.domains.market_data.models import BarTimeframe, BookLevel, OrderBook, Tick, TickStat
 from core.events.domain_events import BookUpdated, DomainEvent, EventType, TickReceived
 from core.ports.interfaces import IBarRepository, IEventBus, ISymbolRepository
+from application.monitoring.tick_counters import TICK_COUNTERS
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +59,14 @@ class MarketDataEngine:
         self.books: Dict[str, OrderBook] = {}  # Symbol -> OrderBook
         self.stats: Dict[str, TickStat] = {}  # Symbol -> TickStat
         self.bar_aggregators: Dict[str, Dict[BarTimeframe, BarAggregator]] = {}  # Symbol -> {Timeframe -> Aggregator}
+
+        # Phase 2: Per-symbol bounded queues, sequence numbers, and dedicated worker tasks
+        import os
+        self.queue_maxsize = int(os.environ.get("MARKET_DATA_QUEUE_MAXSIZE", "5000"))
+        self._symbol_queues: Dict[str, asyncio.Queue] = {}
+        self._symbol_tasks: Dict[str, asyncio.Task] = {}
+        self._symbol_seq: Dict[str, int] = {}
+        self._queue_high_water_warned: Dict[str, float] = {}
 
     def _get_or_create_aggregators(self, symbol: str) -> Dict[BarTimeframe, BarAggregator]:
         """Ensure bar aggregators exist for all 9 timeframes for a given symbol."""
@@ -133,31 +142,36 @@ class MarketDataEngine:
         """
         return False
 
-    async def process_tick(self, tick: Tick) -> None:
-        """
-        Main tick pipeline:
-        1. Validate & filter tick
-        2. Store in-memory latest tick
-        3. Update symbol statistics
-        4. Update DOM timestamp if book present
-        5. Dispatch to bar aggregators across all timeframes
-        6. Persist to Redis cache (if configured)
-        7. Publish TICK_RECEIVED domain event
-        """
-        if self._is_stale(tick) or self._is_noise(tick):
-            # _is_stale already logged the actionable detail at WARNING (rate
-            # limited); this stays at debug for the noise-filter path.
-            logger.debug(f"Tick filtered for symbol {tick.symbol}")
-            return
+    def _get_or_create_queue(self, symbol: str) -> asyncio.Queue:
+        """Get or initialize a bounded queue and dedicated worker task for `symbol`."""
+        if symbol not in self._symbol_queues:
+            q: asyncio.Queue = asyncio.Queue(maxsize=self.queue_maxsize)
+            self._symbol_queues[symbol] = q
+            self._symbol_seq[symbol] = 0
+            task = asyncio.create_task(
+                self._run_symbol_consumer(symbol, q),
+                name=f"market_data_consumer_{symbol}"
+            )
+            self._symbol_tasks[symbol] = task
+        return self._symbol_queues[symbol]
 
+    async def _run_symbol_consumer(self, symbol: str, queue: asyncio.Queue) -> None:
+        """Dedicated consumer task per symbol. Drains ticks in strict FIFO sequence."""
+        while True:
+            try:
+                seq, tick = await queue.get()
+                try:
+                    await self._dispatch_symbol_tick(seq, tick)
+                finally:
+                    queue.task_done()
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.exception("Error in symbol consumer for %s: %s", symbol, e)
+
+    async def _dispatch_symbol_tick(self, seq: int, tick: Tick) -> None:
+        """Dispatches an ordered tick to bar aggregators and downstream subscribers."""
         symbol = tick.symbol
-
-        # Update latest tick in-memory state
-        self.ticks[symbol] = tick
-
-        # Update symbol statistics
-        self._update_stats(tick)
-
         # Update order book timestamp if book exists for symbol
         if symbol in self.books:
             self.books[symbol].updated_at = tick.timestamp
@@ -167,20 +181,16 @@ class MarketDataEngine:
         for aggregator in aggregators.values():
             await aggregator.process_tick(tick)
 
-        # Mirror the tick into Redis, for readers that do NOT share this process's
-        # memory.
-        #
-        # Not awaited. A Redis round trip per tick serialises ingestion: with several
-        # symbols at 20 ticks/s the loop cannot outrun a 1 ms write, and one slow Redis
-        # response stalls every symbol behind it. The write is fire-and-forget with the
-        # exception logged - a cache must never be able to break price ingestion.
-        #
-        # The 60s TTL the cache applies is deliberately kept: it is the mechanism that
-        # makes a stale entry EXPIRE. The in-memory map has no such bound.
+        # Mirror the tick into Redis
         if self.redis_cache:
             self._mirror_tick_to_cache(tick)
 
         # Publish domain event for downstream consumers (Risk Engine, OMS, WebSockets)
+        ts_ms = (
+            int(tick.timestamp.timestamp() * 1000)
+            if hasattr(tick.timestamp, "timestamp")
+            else None
+        )
         event = TickReceived(
             aggregate_id=symbol,
             payload={
@@ -190,22 +200,88 @@ class MarketDataEngine:
                 "spread": str(tick.spread),
                 "mid": str(tick.mid),
                 "timestamp": tick.timestamp.isoformat(),
-                "source": tick.source
+                "ts": ts_ms,
+                "source": tick.source,
+                "seq": seq,
             }
         )
-        # AWAITED, deliberately.
-        #
-        # Every local subscriber runs here: the margin pipeline, SlTpWorker, the book
-        # matcher. Making this fire-and-forget raised the observed tick rate from
-        # 1.00/s to roughly the feed's own rate, and broke six tests - stop loss and
-        # take profit stopped firing, resting orders stopped filling. Those consumers
-        # must see the price as it is at the moment they are called, not whenever their
-        # scheduled task happens to run.
-        #
-        # The serial wait is what holds ingestion to ~1/s against a 19.7/s feed. That gap
-        # is real; bounding it is a job for the coalescing window, which already limits
-        # how often the database side revalues, not for decoupling consumers from price.
         await self.event_bus.publish(event)
+        TICK_COUNTERS.inc_published(symbol)
+
+    async def process_tick(self, tick: Tick) -> None:
+        """
+        Feeder ingestion entrypoint (Phase 2 non-blocking publish):
+        1. Validate & filter tick (stale, noise)
+        2. Count accepted
+        3. Store in-memory latest tick immediately (consumers read real-time price)
+        4. Update symbol statistics immediately
+        5. Assign monotonic sequence number per symbol (preserves strict ordering)
+        6. Enqueue to per-symbol bounded queue with overflow alarm & targeted backpressure
+        """
+        if self._is_stale(tick):
+            TICK_COUNTERS.inc_stale_dropped(tick.symbol)
+            logger.debug(f"Tick filtered for symbol {tick.symbol}")
+            return
+        if self._is_noise(tick):
+            TICK_COUNTERS.inc_noise_dropped(tick.symbol)
+            logger.debug(f"Tick filtered for symbol {tick.symbol}")
+            return
+
+        symbol = tick.symbol
+        TICK_COUNTERS.inc_accepted(symbol)
+
+        # Update latest tick in-memory state IMMEDIATELY (hot path read access)
+        self.ticks[symbol] = tick
+
+        # Update symbol statistics immediately
+        self._update_stats(tick)
+
+        queue = self._get_or_create_queue(symbol)
+        seq = self._symbol_seq[symbol] + 1
+        self._symbol_seq[symbol] = seq
+
+        # Check high-water mark alarm (80% full)
+        qsize = queue.qsize()
+        threshold = int(self.queue_maxsize * 0.8)
+        if qsize >= threshold:
+            _now = asyncio.get_event_loop().time()
+            last_warned = self._queue_high_water_warned.get(symbol, 0.0)
+            if _now - last_warned >= 5.0:
+                self._queue_high_water_warned[symbol] = _now
+                logger.warning(
+                    "[ALARM] Symbol %s tick queue high-water mark reached: %d/%d (%.1f%%)",
+                    symbol, qsize, self.queue_maxsize, (qsize / self.queue_maxsize) * 100,
+                )
+
+        # Non-blocking publish from feeder loop; apply targeted backpressure if saturated
+        try:
+            queue.put_nowait((seq, tick))
+        except asyncio.QueueFull:
+            logger.warning(
+                "[ALARM] Symbol %s tick queue FULL (%d). Applying backpressure to feed stream.",
+                symbol, self.queue_maxsize,
+            )
+            # Targeted backpressure on this symbol's feed stream: never drop ticks for SL/TP & pending orders
+            await queue.put((seq, tick))
+
+    async def flush(self, symbol: Optional[str] = None) -> None:
+        """Wait until all queued ticks for `symbol` (or all symbols) have been dispatched."""
+        if symbol is not None:
+            if symbol in self._symbol_queues:
+                await self._symbol_queues[symbol].join()
+        else:
+            for q in list(self._symbol_queues.values()):
+                await q.join()
+
+    async def stop(self) -> None:
+        """Cancel and drain symbol consumer tasks on shutdown."""
+        for task in self._symbol_tasks.values():
+            if not task.done():
+                task.cancel()
+        if self._symbol_tasks:
+            await asyncio.gather(*self._symbol_tasks.values(), return_exceptions=True)
+        self._symbol_tasks.clear()
+        self._symbol_queues.clear()
 
     async def process_book_update(self, symbol: str, bids: List[BookLevel], asks: List[BookLevel]) -> None:
         """

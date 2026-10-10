@@ -305,6 +305,26 @@ class ClosePositionHandler:
         # 1. Fetch position
         position = await self.position_repo.find_by_id(command.position_id)
         if not position:
+            getter = getattr(self.position_repo, "get_by_account", None) or getattr(
+                self.position_repo, "get_positions_by_account", None
+            )
+            if getter is not None:
+                try:
+                    candidates = await getter(command.account_login)
+                    import zlib
+
+                    for p in candidates or []:
+                        pid_str = str(getattr(p, "position_id", ""))
+                        ext_str = str(getattr(p, "external_id", "") or "")
+                        deal_str = str(getattr(p, "deal_open", "") or "")
+                        z_id = str((zlib.crc32(pid_str.encode()) % 900000) + 100000)
+                        if str(command.position_id) in (pid_str, ext_str, deal_str, z_id):
+                            position = p
+                            break
+                except Exception:
+                    pass
+
+        if not position:
             raise ValueError(f"Position {command.position_id} not found")
 
         if position.account_login != command.account_login:
@@ -386,7 +406,17 @@ class ClosePositionHandler:
         order_reason = (
             OrderReason[reason_name] if reason_name in OrderReason.__members__ else OrderReason.CLIENT
         )
+        try:
+            import time
+            from api.routers.manager.trading import get_next_order_ticket
+            order_ticket = await get_next_order_ticket(self.order_repo)
+            order_id = str(order_ticket)
+        except Exception:
+            import time
+            order_id = str(int(time.time() * 1000) % 900000 + 100000)
+
         closing_order = Order(
+            ticket_id=order_id,
             account_login=command.account_login,
             symbol=position.symbol,
             order_type=OrderType[close_side],
@@ -421,7 +451,16 @@ class ClosePositionHandler:
             realized_pnl_money = Money(realized_pnl, position.profit.currency)
 
         # 7. Create closing deal
+        try:
+            from api.routers.manager.trading import get_next_deal_ticket
+            deal_ticket = await get_next_deal_ticket(self.deal_repo)
+            deal_id = str(deal_ticket)
+        except Exception:
+            import time
+            deal_id = str(int(time.time() * 1000) % 900000 + 100000)
+
         closing_deal = Deal(
+            deal_id=deal_id,
             order_id=closing_order.ticket_id,
             position_id=position.position_id,
             account_login=command.account_login,

@@ -13,6 +13,7 @@ from typing import List
 
 from core.domains.market_data.engine import MarketDataEngine
 from core.ports.interfaces import ITickFeed
+from application.monitoring.tick_counters import TICK_COUNTERS
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,8 @@ class TickIngestor:
                 async for tick in feed.stream_ticks():
                     if not self._running:
                         break
+                    # Phase 0: count ticks seen from this feed
+                    TICK_COUNTERS.inc_received(tick.symbol)
                     await self.market_data_engine.process_tick(tick)
             except asyncio.CancelledError:
                 logger.info(f"Feed stream cancelled: {feed.name}")

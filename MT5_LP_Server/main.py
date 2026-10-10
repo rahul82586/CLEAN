@@ -322,7 +322,10 @@ async def close_position(req: ClosePositionRequest):
     if res.get("success"):
         return {"status": "success", "data": res}
     else:
-        raise HTTPException(status_code=500, detail=res.get("error", "Failed to close position"))
+        err = res.get("error", "Failed to close position")
+        if "not found" in str(err).lower():
+            raise HTTPException(status_code=404, detail=err)
+        raise HTTPException(status_code=500, detail=err)
 
 @api_router.get("/history-deals")
 async def get_history_deals(from_time: Optional[int] = None, to_time: Optional[int] = None):

@@ -1356,6 +1356,9 @@ export const liveApi: AdminApi = {
     async updateGateway() {
         throw new BackendGapError('updateGateway');
     },
+    async deleteGateway() {
+        throw new BackendGapError('deleteGateway');
+    },
     async testGateway() {
         throw new BackendGapError('testGateway');
     },

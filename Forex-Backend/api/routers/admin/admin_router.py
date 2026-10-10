@@ -406,3 +406,36 @@ async def set_account_password(payload: SetAccountPasswordRequest):
     account.updated_at = datetime.now(timezone.utc)
     await repo.save(account)
     return {"status": "password set", "login": str(payload.login)}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Phase 0: Tick pipeline metrics
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/metrics/ticks",
+    summary="Tick pipeline stage counters (Phase 0 measurement)",
+    response_description=(
+        "Per-symbol counters for every stage of the tick pipeline. "
+        "conservation_ok=false means ticks accepted by the engine did not "
+        "reach a downstream consumer — investigate the unexplained_*_drop fields."
+    ),
+)
+async def get_tick_metrics() -> Dict[str, Any]:
+    """
+    Return per-symbol tick counter snapshot.
+
+    Counters reset only on process restart.  Call this endpoint twice
+    with a known interval to compute per-second rates:
+
+        rate = (snapshot2[sym]["accepted"] - snapshot1[sym]["accepted"]) / interval_s
+    """
+    from application.monitoring.tick_counters import TICK_COUNTERS
+    return {
+        "counters": TICK_COUNTERS.snapshot(),
+        "note": (
+            "counters are cumulative since process start; "
+            "conservation_ok=false indicates an unexplained tick drop"
+        ),
+    }
+

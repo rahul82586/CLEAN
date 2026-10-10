@@ -141,6 +141,24 @@ registerPanel({
 });
 
 registerPanel({
+    id: 'routing',
+    title: 'Routing',
+    icon: 'git-merge',
+    component: React.lazy(() =>
+        import('../../features/routing/RoutingPage').then((m) => ({ default: m.RoutingPage }))
+    ),
+});
+
+registerPanel({
+    id: 'gateways',
+    title: 'Gateways',
+    icon: 'plug',
+    component: React.lazy(() =>
+        import('../../features/gateways/GatewaysPage').then((m) => ({ default: m.GatewaysPage }))
+    ),
+});
+
+registerPanel({
     id: 'trade-panel',
     title: 'Trade Terminal',
     icon: 'pulse',

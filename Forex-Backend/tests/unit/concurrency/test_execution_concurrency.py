@@ -205,3 +205,148 @@ async def test_concurrent_deal_execution_atomicity_and_locking():
     # 2 positions margin used = 2201.00
     assert updated_account.margin_used.amount == Decimal('2201.00')
     assert len(results) == 2
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sltp_close_idempotency():
+    """
+    Test that concurrent close attempts for the same position (e.g. SL/TP worker vs
+    manual close) are idempotent: exactly one close succeeds and duplicate attempts
+    are cleanly skipped or ignored.
+    """
+    from application.workers.sltp_worker import SlTpWorker
+    from core.domains.oms.entities.position import Position
+    from core.domains.oms.enums import PositionAction
+
+    position = Position(
+        position_id="POS_CONCURRENT_1",
+        account_login=100001,
+        symbol="EURUSD",
+        action=PositionAction.BUY,
+        volume=Volume(Decimal("1.0")),
+        price_open=Price(Decimal("1.1000")),
+        contract_size=Decimal("100000"),
+        profit=Money(Decimal("0"), "USD"),
+        price_sl=Price(Decimal("1.0950")),
+    )
+
+    close_calls = 0
+
+    class MockCloseHandler:
+        async def handle(self, cmd):
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls > 1:
+                raise ValueError("position POS_CONCURRENT_1 already closed")
+
+    class MockPositionRepo:
+        async def get_by_symbol(self, symbol):
+            return [position]
+
+    class MockEventBus:
+        def subscribe(self, *args): pass
+        def unsubscribe(self, *args): pass
+        async def publish(self, *args): pass
+
+    from core.domains.oms.position_index import PositionIndex
+    pos_index = PositionIndex()
+    pos_index.rebuild([position])
+
+    worker = SlTpWorker(
+        position_repo=MockPositionRepo(),
+        close_position_handler=MockCloseHandler(),
+        event_bus=MockEventBus(),
+        position_index=pos_index,
+    )
+    await worker.start()
+
+    # Enqueue trigger twice concurrently for the same position
+    res1 = await worker.process_tick("EURUSD", Decimal("1.0900"), Decimal("1.0905"))
+    await worker.flush()
+    # Second tick after position close has processed
+    res2 = await worker.process_tick("EURUSD", Decimal("1.0900"), Decimal("1.0905"))
+    await worker.flush()
+    await worker.stop()
+
+    assert res1 == 1, "First trigger should enqueue position close"
+    assert res2 == 0, "Second trigger after close should find zero open positions"
+    assert close_calls == 1, "Exactly one close transaction should execute"
+
+
+@pytest.mark.asyncio
+async def test_sltp_worker_lp_already_closed_and_success_handling(monkeypatch):
+    """
+    Test that SlTpWorker properly synchronizes positions when LP returns already closed / not found
+    (even on HTTP 404 or 500) and when LP returns MT5 wrapped {"status": "success", "data": {"success": true}}.
+    """
+    from unittest.mock import AsyncMock, MagicMock
+    import httpx
+    from application.workers.sltp_worker import SlTpWorker
+    from core.domains.oms.entities.position import Position
+    from core.domains.oms.enums import PositionAction
+    from core.domains.oms.position_index import PositionIndex
+
+    # Position 1: LP already closed (returns 404 / 500 'not found')
+    pos_lp_closed = Position(
+        position_id="POS_LP_CLOSED_1",
+        account_login=770338,
+        symbol="BTCUSD",
+        action=PositionAction.BUY,
+        volume=Volume(Decimal("0.01")),
+        price_open=Price(Decimal("81743.37")),
+        contract_size=Decimal("1"),
+        profit=Money(Decimal("0"), "USD"),
+        price_sl=Price(Decimal("82642.47")),
+        external_id="5348311",
+    )
+
+    closed_commands = []
+
+    class MockCloseHandler:
+        async def handle(self, cmd):
+            closed_commands.append(cmd)
+
+    class MockPositionRepo:
+        async def get_by_symbol(self, symbol):
+            return [pos_lp_closed]
+
+    class MockEventBus:
+        def subscribe(self, *args): pass
+        def unsubscribe(self, *args): pass
+        async def publish(self, *args): pass
+
+    pos_index = PositionIndex()
+    pos_index.rebuild([pos_lp_closed])
+
+    worker = SlTpWorker(
+        position_repo=MockPositionRepo(),
+        close_position_handler=MockCloseHandler(),
+        event_bus=MockEventBus(),
+        position_index=pos_index,
+    )
+    await worker.start()
+
+    # Mock HTTP response: LP returns 404 with 'Position not found'
+    mock_resp = MagicMock()
+    mock_resp.status_code = 404
+    mock_resp.text = '{"detail": "Position not found for BTCUSD (Ticket: 5348311)"}'
+    mock_resp.json.return_value = {"detail": "Position not found for BTCUSD (Ticket: 5348311)"}
+
+    mock_client = AsyncMock()
+    mock_client.post.return_value = mock_resp
+    mock_client.__aenter__.return_value = mock_client
+    mock_client.__aexit__.return_value = None
+
+    monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: mock_client)
+
+    # Process tick triggering SL
+    await worker.process_tick("BTCUSD", Decimal("82640.00"), Decimal("82641.00"))
+    await worker.flush()
+    await worker.stop()
+
+    assert len(closed_commands) == 1
+    assert closed_commands[0].position_id == "POS_LP_CLOSED_1"
+    assert closed_commands[0].venue_leg_already_unwound is True
+    assert pos_index.get_position("POS_LP_CLOSED_1") is None
+
+

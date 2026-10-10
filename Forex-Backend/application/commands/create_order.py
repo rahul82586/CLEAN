@@ -153,8 +153,12 @@ class CreateOrderHandler:
         if not volume_valid:
             raise ValueError(f"Invalid volume: {volume_reason}")
 
-        # 3. Create Order entity
+        # 3. Create Order entity with monotonic sequential integer ticket
+        from api.routers.manager.trading import get_next_order_ticket
+        order_ticket = await get_next_order_ticket(self.order_repo)
+
         order = Order(
+            ticket_id=str(order_ticket),
             account_login=command.account_login,
             symbol=command.symbol,
             order_type=command.order_type,

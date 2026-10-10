@@ -359,6 +359,7 @@
 .adm-table tbody tr:hover { background: var(--theia-list-hoverBackground); }
 .adm-table tbody tr.selected { background: var(--theia-list-activeSelectionBackground); color: var(--theia-list-activeSelectionForeground); }
 .adm-table tbody tr.adm-row-disabled { opacity: 0.45; }
+.adm-table-grid th, .adm-table-grid td { border-right: 1px solid var(--theia-border, #333333); }
 
 /* ── Numbers ────────────────────────────────────────────────────── */
 .adm-num { text-align: right; font-variant-numeric: tabular-nums; font-family: monospace; }
