@@ -162,7 +162,24 @@ class InMemoryPositionRepository:
 
     async def save(self, position: Position, session: Any = None) -> Position:
         self.positions[position.position_id] = position
+        try:
+            from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
+            GLOBAL_POSITION_INDEX.upsert(position)
+        except Exception:
+            pass
         return position
+
+    async def delete(self, position_id: str, session: Any = None) -> bool:
+        pid = str(position_id)
+        if pid in self.positions:
+            del self.positions[pid]
+            try:
+                from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
+                GLOBAL_POSITION_INDEX.remove(pid)
+            except Exception:
+                pass
+            return True
+        return False
 
     async def find_by_id(self, position_id: str, session: Any = None) -> Optional[Position]:
         return self.positions.get(position_id)
@@ -504,8 +521,11 @@ class TradingHarness:
         import os
         os.environ.pop("MARKET_DATA_MAX_TICK_AGE_SECONDS", None)
         os.environ.pop("PRICING_MAX_TICK_AGE_SECONDS", None)
+        os.environ.pop("TICK_MARGIN_COALESCE_SECONDS", None)
         from api.di_providers import _container
         _container.clear()
+        from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
+        GLOBAL_POSITION_INDEX.rebuild([])
         from core.domains.market_data.engine import MarketDataEngine
 
         self.market_data_engine = MarketDataEngine(
@@ -558,6 +578,9 @@ class TradingHarness:
         """Push a tick through the real MarketDataEngine, so it updates the price cache
         AND publishes TICK_RECEIVED to the margin pipeline and the resting book."""
         await self.market_data_engine.process_tick(make_tick(symbol, bid, ask))
+        await self.market_data_engine.flush(symbol)
+        if hasattr(self, "stack") and getattr(self.stack, "sltp_worker", None) is not None:
+            await self.stack.sltp_worker.flush()
 
     def latest_tick(self, symbol: str) -> Optional[Tick]:
         return self.market_data_engine.get_latest_tick(symbol)

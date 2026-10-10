@@ -113,11 +113,7 @@ export const MT5_ADMIN_TREE: AdminTreeNode[] = [
     {
         id: 'gateways',
         label: 'Gateways',
-        icon: 'radio-tower',
-        children: [
-            { id: 'gateways.list',    label: 'Gateway List', icon: 'list-unordered' },
-            { id: 'gateways.routing', label: 'Routing',      icon: 'git-merge' }
-        ]
+        icon: 'plug'
     },
     {
         id: 'data-feeds',
@@ -159,13 +155,7 @@ export const MT5_ADMIN_TREE: AdminTreeNode[] = [
     {
         id: 'routing',
         label: 'Routing',
-        icon: 'git-merge',
-        children: [
-            { id: 'routing.rules',      label: 'Routing Rules',     icon: 'list-ordered' },
-            { id: 'routing.a-book',     label: 'A-Book',            icon: 'arrow-right' },
-            { id: 'routing.b-book',     label: 'B-Book',            icon: 'arrow-left' },
-            { id: 'routing.gateways',   label: 'LP Gateways',       icon: 'radio-tower' }
-        ]
+        icon: 'git-merge'
     },
     {
         id: 'funds-etf',

@@ -701,7 +701,11 @@ class LiquidationWorker:
                 realised_pnl = None
 
         # 1. Create closing Order
+        from api.routers.manager.trading import get_next_order_ticket, get_next_deal_ticket
+        order_ticket = await get_next_order_ticket(self.order_repo)
+
         closing_order = Order(
+            ticket_id=str(order_ticket),
             account_login=account.login,
             symbol=position.symbol,
             order_type=OrderType[close_side],
@@ -721,7 +725,9 @@ class LiquidationWorker:
         await self.order_repo.save(closing_order)
         
         # 2. Create Deal
+        deal_ticket = await get_next_deal_ticket(self.deal_repo)
         closing_deal = Deal(
+            deal_id=str(deal_ticket),
             order_id=closing_order.ticket_id,
             position_id=position.position_id,
             account_login=account.login,

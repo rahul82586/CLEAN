@@ -70,10 +70,22 @@ class WebSocketEventBridge:
         symbol = payload.get("symbol")
         bid, ask = payload.get("bid"), payload.get("ask")
         if symbol is not None and bid is not None and ask is not None:
-            await client_sockets.broadcast_tick(
-                str(symbol), str(bid), str(ask),
-                str(payload["spread"]) if payload.get("spread") is not None else None,
-            )
+            try:
+                await client_sockets.broadcast_tick(
+                    str(symbol),
+                    str(bid),
+                    str(ask),
+                    str(payload["spread"]) if payload.get("spread") is not None else None,
+                    timestamp=payload.get("timestamp"),
+                    ts=payload.get("ts"),
+                )
+            except TypeError:
+                await client_sockets.broadcast_tick(
+                    str(symbol),
+                    str(bid),
+                    str(ask),
+                    str(payload["spread"]) if payload.get("spread") is not None else None,
+                )
     
     async def _on_order_created(self, event: DomainEvent) -> None:
         payload = getattr(event, 'payload', {})

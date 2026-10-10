@@ -49,6 +49,7 @@ from application.services.execution_orchestrator import ExecutionOrchestrator
 from application.services.risk_service import PreTradeRiskService
 from application.workers.liquidation_worker import LiquidationWorker
 from application.workers.sltp_worker import SlTpWorker
+from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
 from core.domains.execution.models import ExecutionDestination
 from core.domains.execution.router import SmartOrderRouter
 from core.domains.market_data.engine import MarketDataEngine
@@ -128,6 +129,7 @@ class TradingStack:
             "create_order_handler": self.create_order_handler,
             "liquidation_service": self.liquidation_service,
             "liquidation_worker": self.liquidation_worker,
+            "position_index": GLOBAL_POSITION_INDEX,
         }
 
 
@@ -445,6 +447,7 @@ async def build_trading_stack(
         position_repo=position_repo,
         close_position_handler=close_position_handler,
         event_bus=event_bus,
+        position_index=GLOBAL_POSITION_INDEX,
     )
 
     # D11: modify and cancel existed and were complete, but nothing ever built

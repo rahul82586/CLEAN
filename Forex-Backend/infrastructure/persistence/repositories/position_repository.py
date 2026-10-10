@@ -8,6 +8,7 @@ from core.ports.interfaces import IPositionRepository
 from ..mappers import position_to_db, db_to_position
 from ..db_models import PositionModel
 
+
 class SqlPositionRepository(IPositionRepository[Position]):
     """PostgreSQL implementation of IPositionRepository."""
 
@@ -23,11 +24,19 @@ class SqlPositionRepository(IPositionRepository[Position]):
             return res.rowcount > 0
 
         if session:
-            return await _del(session)
-        async with self.session_factory() as sess:
-            res = await _del(sess)
-            await sess.commit()
-            return res
+            ok = await _del(session)
+        else:
+            async with self.session_factory() as sess:
+                ok = await _del(sess)
+                await sess.commit()
+
+        if ok:
+            try:
+                from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
+                GLOBAL_POSITION_INDEX.remove(str(position_id))
+            except Exception:
+                pass
+        return ok
 
     async def save(self, position: Position, session: Optional[AsyncSession] = None) -> Position:
         async def _save(sess: AsyncSession):
@@ -36,11 +45,18 @@ class SqlPositionRepository(IPositionRepository[Position]):
             return position
 
         if session:
-            return await _save(session)
-        async with self.session_factory() as sess:
-            result = await _save(sess)
-            await sess.commit()
-            return result
+            result = await _save(session)
+        else:
+            async with self.session_factory() as sess:
+                result = await _save(sess)
+                await sess.commit()
+
+        try:
+            from core.domains.oms.position_index import GLOBAL_POSITION_INDEX
+            GLOBAL_POSITION_INDEX.upsert(result)
+        except Exception:
+            pass
+        return result
 
     async def find_by_id(self, position_id: str, session: Optional[AsyncSession] = None) -> Optional[Position]:
         async def _find(sess: AsyncSession):
@@ -173,33 +189,8 @@ class SqlPositionRepository(IPositionRepository[Position]):
     async def update_valuation(self, position_id: str, side: str,
                                price_current: Decimal, when=None,
                                session: Optional[AsyncSession] = None) -> Optional[dict]:
-        """D15: write a revaluation without writing the rest of the row.
-
-        `save()` is a full-row merge, and the tick pipeline holds objects it
-        fetched before it did its work. Persisting those races anything else that
-        moved the position in between - observed live against Neon as a partial
-        close being UNDONE by the next tick, so the following close dealt the
-        position's ORIGINAL volume. D8b gave accounts a column-scoped write for
-        precisely this reason; this is the position equivalent.
-
-        Two things make it safe rather than merely narrower:
-
-        * the PnL is computed IN THE STATEMENT from the volume and open price the
-          row holds at write time, so a concurrent partial close changes the result
-          instead of being overwritten by it;
-        * `time_done IS NULL` means a tick can never reopen or reprice a position
-          that a close, the SL/TP worker or the liquidation worker has finished.
-
-        `side` is the position's own action, so the statement can value a long at
-        the price it can SELL at and a short at the price it can BUY back at.
-
-        Returns {"volume", "profit", "price_current"} as Decimals for the row that
-        was written, or None if it was closed or vanished - the caller must then
-        drop the position from its view of the account rather than keep a number
-        for a position that no longer exists.
-        """
+        """D15: write a revaluation without writing the rest of the row."""
         from datetime import datetime as _dt, timezone as _tz
-
         from sqlalchemy import text as sa_text
 
         stmt = sa_text(
@@ -215,7 +206,6 @@ class SqlPositionRepository(IPositionRepository[Position]):
         )
         params = {
             "price": str(price_current),
-            # normalised: the statement only ever compares against 'BUY'
             "side": "BUY" if str(side).upper().startswith("BUY") else "SELL",
             "when": when or _dt.now(_tz.utc),
             "position_id": position_id,
@@ -277,15 +267,3 @@ class SqlPositionRepository(IPositionRepository[Position]):
             )
             models = result.scalars().all()
             return [db_to_position(m) for m in models]
-
-    async def delete(self, position_id: str) -> bool:
-        async with self.session_factory() as session:
-            result = await session.execute(
-                select(PositionModel).where(PositionModel.position_id == position_id)
-            )
-            model = result.scalar_one_or_none()
-            if model:
-                await session.delete(model)
-                await session.commit()
-                return True
-            return False

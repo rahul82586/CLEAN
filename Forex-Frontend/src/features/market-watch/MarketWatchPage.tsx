@@ -1,5 +1,6 @@
 import * as React from 'react';
 import { API } from '../../services/api';
+import { wsStreamService } from '../../services/api/ticksStream';
 
 interface QuoteRow {
     symbol: string;
@@ -128,20 +129,12 @@ export function MarketWatchPage(): React.ReactElement {
                 const prevMap: Record<string, QuoteRow> = {};
                 prev.forEach(r => { prevMap[r.symbol] = r; });
 
-                // NO age filter. This previously dropped every symbol whose quote was
-                // older than 60 seconds, so after the FX close 356 of 362 instruments
-                // disappeared from the table with nothing to say they had been removed -
-                // the screen looked healthy while almost the whole list was missing.
-                // Every symbol is now listed and labelled.
                 const rows: QuoteRow[] = Object.entries(data)
                     .map(([symbol, q]) => {
                         const old = prevRef.current[symbol];
                         let flashBid: 'up' | 'down' | undefined;
                         let flashAsk: 'up' | 'down' | undefined;
 
-                        // Both sides must be REAL numbers. With nulls, `null > 100` is false
-                        // but `null < 100` is TRUE, so a symbol going from no-price to priced
-                        // would flash as a fall, and one losing its price would too.
                         const haveOld = !!old && old.bid != null && old.ask != null;
                         const haveNew = q.bid != null && q.ask != null;
                         if (haveOld && haveNew) {
@@ -154,8 +147,6 @@ export function MarketWatchPage(): React.ReactElement {
 
                         prevRef.current[symbol] = { bid: q.bid, ask: q.ask };
 
-                        // q.ask - q.bid on nulls is 0, which would print a 0.0 spread for a
-                        // symbol with no quote. Absent stays absent.
                         const rawSpread = q.spread != null
                             ? q.spread
                             : (q.ask != null && q.bid != null ? q.ask - q.bid : null);
@@ -169,7 +160,6 @@ export function MarketWatchPage(): React.ReactElement {
                             symbol,
                             bid: q.bid,
                             ask: q.ask,
-                              // A missing age is not 0 seconds old; it is unknown.
                               age: q.age != null ? q.age : Number.POSITIVE_INFINITY,
                               marketState: q.marketState ?? 'no_data',
                               isMarketOpen: q.isMarketOpen,
@@ -192,24 +182,93 @@ export function MarketWatchPage(): React.ReactElement {
     }, []);
 
     React.useEffect(() => {
+        // Initial fetch
         fetchQuotes();
-        const iv = setInterval(fetchQuotes, 1000);
-        return () => clearInterval(iv);
+
+        // Realtime low-latency WebSocket stream subscription (/ws/stream)
+        const unsubscribe = wsStreamService.subscribeTicks((incomingTicks) => {
+            setError(null);
+            setLastUpdate(new Date());
+
+            setQuotes(prev => {
+                const map: Record<string, QuoteRow> = {};
+                prev.forEach(r => { map[r.symbol] = { ...r }; });
+
+                for (const [symbol, q] of Object.entries(incomingTicks)) {
+                    const old = prevRef.current[symbol];
+                    let flashBid: 'up' | 'down' | undefined;
+                    let flashAsk: 'up' | 'down' | undefined;
+
+                    const haveOld = !!old && old.bid != null && old.ask != null;
+                    const haveNew = q.bid != null && q.ask != null;
+                    if (haveOld && haveNew) {
+                        const p = old as { bid: number; ask: number };
+                        if (q.bid! > p.bid) flashBid = 'up';
+                        else if (q.bid! < p.bid) flashBid = 'down';
+                        if (q.ask! > p.ask) flashAsk = 'up';
+                        else if (q.ask! < p.ask) flashAsk = 'down';
+                    }
+
+                    prevRef.current[symbol] = { bid: q.bid, ask: q.ask };
+
+                    const rawSpread = q.spread != null
+                        ? q.spread
+                        : (q.ask != null && q.bid != null ? q.ask - q.bid : null);
+                    const spreadVal = rawSpread == null
+                        ? null
+                        : (q.ask < 10
+                            ? Math.round(rawSpread * 100000) / 10
+                            : Math.round(rawSpread * 100) / 100);
+
+                    const existing = map[symbol];
+                    map[symbol] = {
+                        symbol,
+                        bid: q.bid,
+                        ask: q.ask,
+                        age: q.age != null ? q.age : 0,
+                        marketState: q.marketState ?? existing?.marketState ?? 'open',
+                        isMarketOpen: q.isMarketOpen ?? true,
+                        isTickStale: q.isTickStale ?? false,
+                        maxQuoteDelay: q.maxQuoteDelay ?? existing?.maxQuoteDelay,
+                        spread: spreadVal,
+                        prevBid: old?.bid,
+                        prevAsk: old?.ask,
+                        flashBid,
+                        flashAsk,
+                    };
+                }
+
+                return Object.values(map).sort((a, b) => a.symbol.localeCompare(b.symbol));
+            });
+        });
+
+        // Secondary fallback sync (5s) for full list reconciliation
+        const fallbackIv = setInterval(fetchQuotes, 5000);
+
+        return () => {
+            unsubscribe();
+            clearInterval(fallbackIv);
+        };
     }, [fetchQuotes]);
 
-    // Clear flash state after 400ms
+    // Clean flash states in single batched 400ms interval without setting cascading timers
     React.useEffect(() => {
-        quotes.forEach(row => {
-            if (row.flashBid || row.flashAsk) {
-                if (flashTimers.current[row.symbol]) clearTimeout(flashTimers.current[row.symbol]);
-                flashTimers.current[row.symbol] = setTimeout(() => {
-                    setQuotes(prev => prev.map(r =>
-                        r.symbol === row.symbol ? { ...r, flashBid: undefined, flashAsk: undefined } : r
-                    ));
-                }, 400);
-            }
-        });
-    }, [quotes]);
+        const iv = setInterval(() => {
+            setQuotes(prev => {
+                if (!prev || prev.length === 0) return prev;
+                let hasFlash = false;
+                for (const r of prev) {
+                    if (r.flashBid || r.flashAsk) {
+                        hasFlash = true;
+                        break;
+                    }
+                }
+                if (!hasFlash) return prev;
+                return prev.map(r => (r.flashBid || r.flashAsk ? { ...r, flashBid: undefined, flashAsk: undefined } : r));
+            });
+        }, 400);
+        return () => clearInterval(iv);
+    }, []);
 
     const filtered = filter.trim()
         ? quotes.filter(r => r.symbol.toLowerCase().includes(filter.toLowerCase()))

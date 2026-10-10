@@ -21,14 +21,15 @@ interface GroupSettingsModalProps {
 
 const TABS = [
     { id: 'common', label: 'Common' },
-    { id: 'gateway', label: 'Gateway' },
+
     { id: 'company', label: 'Company' },
     { id: 'newsMail', label: 'News & Mail' },
     { id: 'permissions', label: 'Permissions' },
     { id: 'margin', label: 'Margin' },
     { id: 'symbols', label: 'Symbols' },
     { id: 'commissions', label: 'Commissions' },
-    { id: 'reports', label: 'Reports' }
+    { id: 'reports', label: 'Reports' },
+    { id: 'gateway', label: 'Gateway' }
 ];
 
 export function GroupSettingsModal({ groupName, initialName = '', onClose, onSaved }: GroupSettingsModalProps): React.ReactElement {

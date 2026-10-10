@@ -7,7 +7,16 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # forward references in annotations only (no runtime import cycle)
     from core.domains.oms.entities.order import Order
+import itertools
+import time
 import uuid
+
+_DEAL_TICKET_SEQ = itertools.count(start=int(time.time() * 10) % 900000 + 700000)
+
+
+def _default_deal_ticket() -> str:
+    return str(next(_DEAL_TICKET_SEQ))
+
 
 from core.domains.common.value_objects import Money, Price, Volume
 from core.domains.oms.enums import (
@@ -30,7 +39,7 @@ class Deal:
     - OUT_BY: Closes by opposite position
     """
     # Identity
-    deal_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    deal_id: str = field(default_factory=_default_deal_ticket)
     order_id: Optional[str] = None  # Link to originating order
     position_id: Optional[str] = None  # Link to position
     

@@ -7,7 +7,16 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # forward references in annotations only (no runtime import cycle)
     from core.domains.oms.entities.deal import Deal
+import itertools
+import time
 import uuid
+
+_POS_TICKET_SEQ = itertools.count(start=int(time.time() * 10) % 900000 + 800000)
+
+
+def _default_position_ticket() -> str:
+    return str(next(_POS_TICKET_SEQ))
+
 
 from core.domains.common.value_objects import Money, Price, Volume
 from core.domains.oms.enums import (
@@ -31,7 +40,7 @@ class Position:
     - SELL: Short position
     """
     # Identity
-    position_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    position_id: str = field(default_factory=_default_position_ticket)
     external_id: Optional[str] = None  # Exchange/ECN position ID
     identifier: Optional[str] = None   # For netting: groups positions by identifier
     

@@ -72,6 +72,15 @@ def build_tick_margin_pipeline(container: Any) -> TickMarginPipeline:
             coalesce,
         )
 
+    pos_idx = None
+    if hasattr(container, "get"):
+        pos_idx = container.get("position_index")
+    elif hasattr(container, "resolve"):
+        try:
+            pos_idx = container.resolve("position_index")
+        except Exception:
+            pass
+
     return TickMarginPipeline(
         position_repo=container.resolve(IPositionRepository),
         account_repo=container.resolve(IAccountRepository),
@@ -79,6 +88,7 @@ def build_tick_margin_pipeline(container: Any) -> TickMarginPipeline:
         risk_engine=container.resolve(RiskEngine),
         event_bus=container.resolve(IEventBus),
         coalesce_seconds=coalesce,
+        position_index=pos_idx,
     )
 
 

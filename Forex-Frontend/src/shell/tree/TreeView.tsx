@@ -20,6 +20,7 @@ export function TreeView({ onOpenNode }: TreeViewProps): React.ReactElement {
     const [expanded, setExpanded] = React.useState<Set<string>>(() => new Set(DEFAULT_EXPANDED));
     const [selectedId, setSelectedId] = React.useState<string | undefined>();
     const [groupsList, setGroupsList] = React.useState<any[]>([]);
+    const [gatewaysList, setGatewaysList] = React.useState<any[]>([]);
 
     const refreshGroups = React.useCallback(async () => {
         try {
@@ -30,9 +31,19 @@ export function TreeView({ onOpenNode }: TreeViewProps): React.ReactElement {
         }
     }, []);
 
+    const refreshGateways = React.useCallback(async () => {
+        try {
+            const data = await API.getGateways();
+            setGatewaysList(Array.isArray(data) ? data : []);
+        } catch (e) {
+            console.error('Failed to load gateways for sidebar tree:', e);
+        }
+    }, []);
+
     React.useEffect(() => {
         void refreshGroups();
-    }, [refreshGroups]);
+        void refreshGateways();
+    }, [refreshGroups, refreshGateways]);
 
     const toggle = React.useCallback((id: string) => {
         setExpanded((prev) => {
@@ -91,8 +102,22 @@ export function TreeView({ onOpenNode }: TreeViewProps): React.ReactElement {
         return root;
     }, [groupsList]);
 
+    const buildGatewaysSubtree = React.useCallback((): AdminTreeNode[] => {
+        return gatewaysList.map((g) => ({
+            id: `gateways:${g.id}`,
+            label: g.name,
+            icon: g.is_active || g.status === 'Online' || g.status === 'CONNECTED' ? 'plug' : 'debug-disconnect',
+        }));
+    }, [gatewaysList]);
+
     const renderNode = (nodeIn: AdminTreeNode, depth = 0): React.ReactNode => {
-        const node = nodeIn.id === 'groups' ? { ...nodeIn, children: buildGroupsSubtree() } : nodeIn;
+        let node = nodeIn;
+        if (nodeIn.id === 'groups') {
+            node = { ...nodeIn, children: buildGroupsSubtree() };
+        } else if (nodeIn.id === 'gateways') {
+            const gwSub = buildGatewaysSubtree();
+            node = { ...nodeIn, children: gwSub.length > 0 ? gwSub : undefined };
+        }
         const hasChildren = Boolean(node.children && node.children.length > 0);
         const isExpanded = expanded.has(node.id);
         const isSelected = selectedId === node.id;

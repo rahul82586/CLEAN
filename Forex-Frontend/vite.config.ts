@@ -12,6 +12,7 @@ export default defineConfig({
             '/backend': {
                 target: process.env.VITE_PROXY_TARGET || 'http://127.0.0.1:8001',
                 changeOrigin: true,
+                ws: true,
                 rewrite: (path) => path.replace(/^\/backend/, ''),
             },
         },

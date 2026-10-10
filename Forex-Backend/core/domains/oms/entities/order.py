@@ -3,7 +3,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Optional
+import itertools
+import time
 import uuid
+
+_ORDER_TICKET_SEQ = itertools.count(start=int(time.time() * 10) % 900000 + 800000)
+
+
+def _default_order_ticket() -> str:
+    return str(next(_ORDER_TICKET_SEQ))
+
 
 from core.domains.common.value_objects import Price, Volume
 from core.domains.oms.enums import (
@@ -26,7 +35,7 @@ class Order:
                BUY_STOP_LIMIT, SELL_STOP_LIMIT
     """
     # Identity
-    ticket_id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    ticket_id: str = field(default_factory=_default_order_ticket)
     external_id: Optional[str] = None  # Exchange/ECN order ID
     gateway_id: Optional[str] = None   # Gateway execution order ID
     

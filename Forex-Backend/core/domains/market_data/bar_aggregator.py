@@ -13,6 +13,7 @@ from typing import Optional
 from core.domains.market_data.models import Bar, BarTimeframe, Tick
 from core.events.domain_events import BarAggregated, DomainEvent, EventType
 from core.ports.interfaces import IBarRepository, IEventBus
+from application.monitoring.tick_counters import TICK_COUNTERS
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +84,8 @@ class BarAggregator:
 
     async def process_tick(self, tick: Tick) -> None:
         """Process an incoming tick and aggregate into the active bar."""
+        # Phase 0: count bar aggregator ticks per symbol (across all timeframes)
+        TICK_COUNTERS.inc_bar_aggregator(tick.symbol)
         period_start = self._get_period_start(tick.timestamp)
         price = tick.mid  # OHLCV bars use the mid price
 
@@ -123,12 +126,9 @@ class BarAggregator:
         self.current_bar.close_time = datetime.now(timezone.utc)
         bar = self.current_bar
 
-        # Save bar to persistence if repository available
+        # Phase 3: Save bar to persistence off the tick path via background task
         if self.bar_repository:
-            try:
-                await self.bar_repository.save_bar(bar)
-            except Exception as e:
-                logger.error(f"Failed to persist bar {bar.symbol} {bar.timeframe.value}: {e}")
+            asyncio.create_task(self._persist_bar_background(bar))
 
         # Emit domain event
         event = BarAggregated(
@@ -146,3 +146,11 @@ class BarAggregator:
             }
         )
         await self.event_bus.publish(event)
+
+    async def _persist_bar_background(self, bar: Bar) -> None:
+        """Background task to persist completed bars without blocking tick ingestion."""
+        try:
+            await self.bar_repository.save_bar(bar)
+        except Exception as e:
+            logger.error(f"Failed to persist bar {bar.symbol} {bar.timeframe.value}: {e}")
+

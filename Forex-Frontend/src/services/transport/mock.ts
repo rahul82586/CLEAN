@@ -119,14 +119,146 @@ const deals: any[] = [
 ];
 
 let routingRules = [
-    { id: 1, name: 'dealer', priority: 1, is_enabled: true, match_groups: ['real\\real', 'real\\real-A'], match_symbols: ['*'], action: 'TO_DEALER' },
-    { id: 2, name: 'Auto Execution', priority: 2, is_enabled: true, match_groups: ['demo\\*'], match_symbols: ['*'], action: 'CONFIRM_CLIENT' },
+    {
+        id: 1,
+        name: 'dealer',
+        priority: 1,
+        is_enabled: true,
+        action: 'Process to dealers, skip if no dealers online',
+        action_type: 'Process to dealers',
+        skip_if_no_dealers: true,
+        request_type: 'All',
+        order_type: 'All',
+        conditions: [
+            { type: 'Group', condition: 'Equal (=)', value: 'real\\*' }
+        ],
+        dealers: [
+            { login: '3', name: 'MetaTrader 5 Gateway clone (3)' }
+        ]
+    },
+    {
+        id: 2,
+        name: 'Auto Execution',
+        priority: 2,
+        is_enabled: true,
+        action: 'Confirm by request price',
+        action_type: 'Confirm by request price',
+        skip_if_no_dealers: false,
+        request_type: 'All',
+        order_type: 'All',
+        conditions: [
+            { type: 'Group', condition: 'Equal (=)', value: '*' }
+        ],
+        dealers: [
+            { login: '1000', name: 'First Admin (1000)' }
+        ]
+    },
+    {
+        id: 3,
+        name: 'ff',
+        priority: 3,
+        is_enabled: true,
+        action: 'Delay for 0 milliseconds',
+        action_type: 'Delay in milliseconds',
+        delay_ms: 0,
+        skip_if_no_dealers: false,
+        request_type: 'All',
+        order_type: 'All',
+        conditions: [
+            { type: 'Symbols', condition: 'Equal (=)', value: 'EURUSD*' }
+        ],
+        dealers: [
+            { login: '2', name: 'FT MT5 Gateway (2)' }
+        ]
+    }
 ];
 
 let gateways = [
-    { id: 1, name: 'LP-Centroid-Primary', type: 'FIX', host: 'fix.lp.example.com', port: 8443, username: 'BROKER01', is_active: true, status: 'CONNECTED' },
-    { id: 2, name: 'TradeServer-WS', type: 'WS', host: 'localhost', port: 8003, username: '', is_active: true, status: 'CONNECTED' },
-    { id: 3, name: 'LP-Backup-REST', type: 'REST', host: 'api.lp2.example.com', port: 443, username: 'broker-backup', is_active: false, status: 'DISABLED' },
+    {
+        id: 1,
+        name: 'MetaTrader 5 WL',
+        module: 'MetaTrader 5 Gateway',
+        mode: 'T + Q',
+        server: '78.140.180.22:443',
+        login: '1000',
+        groups: '*',
+        symbols: 'Forex\\*;ECN\\*',
+        last_active: 'Online',
+        status: 'Online',
+        is_active: true,
+        import_traders_balances: false,
+        import_symbol_settings: false,
+        translations: [
+            { symbol: 'EURUSD', source: 'EUR/USD', bid: -1, ask: 1 }
+        ],
+        parameters: [
+            { parameter: 'Max Price Deviation', value: '50' },
+            { parameter: 'Limit Orders Coverage Mode', value: 'Market' },
+            { parameter: 'Quotes Time Original', value: 'No' },
+            { parameter: 'Last Price Markup', value: 'Yes' },
+        ],
+        timeouts: { reconnect_interval: 1, reconnect_attempts: 5, reconnect_series_interval: 60 },
+        monitoring: { enable_logging: true, enable_profiling: false, collect_days: 0 },
+    },
+    {
+        id: 2,
+        name: 'Currenex Gateway',
+        module: 'Currenex FIX Gateway',
+        mode: 'T + Q',
+        server: 'dret-fix-ssl.currenex.com:8443',
+        login: 'BROKER_01',
+        groups: '*',
+        symbols: '*',
+        last_active: 'Online',
+        status: 'Online',
+        is_active: true,
+        import_traders_balances: false,
+        import_symbol_settings: false,
+        translations: [],
+        parameters: [
+            { parameter: 'Max Price Deviation', value: '30' },
+        ],
+        timeouts: { reconnect_interval: 1, reconnect_attempts: 5, reconnect_series_interval: 60 },
+        monitoring: { enable_logging: false, enable_profiling: false, collect_days: 0 },
+    },
+    {
+        id: 3,
+        name: 'Liquidity provider 1',
+        module: 'Integral FX Inside Gateway',
+        mode: 'T + Q',
+        server: '203.4.179.12:443',
+        login: 'LP_ACC_01',
+        groups: '*',
+        symbols: '*',
+        last_active: '2026.02.14 11:13:00',
+        status: 'Disconnected',
+        is_active: false,
+        import_traders_balances: false,
+        import_symbol_settings: false,
+        translations: [],
+        parameters: [],
+        timeouts: { reconnect_interval: 2, reconnect_attempts: 3, reconnect_series_interval: 120 },
+        monitoring: { enable_logging: false, enable_profiling: false, collect_days: 0 },
+    },
+    {
+        id: 4,
+        name: 'Broker 1',
+        module: 'LMAX FIX Gateway',
+        mode: 'T + Q',
+        server: 'access.metatrader5.com:443',
+        login: 'LMAX_02',
+        groups: '*',
+        symbols: '*',
+        last_active: 'Online',
+        status: 'Online',
+        is_active: true,
+        import_traders_balances: false,
+        import_symbol_settings: false,
+        translations: [],
+        parameters: [],
+        timeouts: { reconnect_interval: 1, reconnect_attempts: 5, reconnect_series_interval: 60 },
+        monitoring: { enable_logging: false, enable_profiling: false, collect_days: 0 },
+    }
 ];
 
 let clients = [
@@ -1125,6 +1257,11 @@ export const mockApi: AdminApi = {
     async updateGateway(id: number, data: any) {
         await delay();
         gateways = gateways.map((g) => (g.id === id ? { ...g, ...data } : g));
+        return { status: 'success' };
+    },
+    async deleteGateway(id: number) {
+        await delay();
+        gateways = gateways.filter((g) => g.id !== id);
         return { status: 'success' };
     },
     async testGateway(id: number) {

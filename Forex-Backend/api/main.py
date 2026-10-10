@@ -782,6 +782,52 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
             app.state.event_bridge = event_bridge
             logger.info("✅ WebSocketEventBridge started")
 
+            # 6. Phase 0: Tick History Writer (24-hour ring buffer) +
+            #    conservation check background task.
+            try:
+                from application.services.tick_history_writer import TickHistoryWriter
+                from application.monitoring.tick_counters import TICK_COUNTERS
+
+                _db_manager = _container_lookup("database")
+                if _db_manager is not None and getattr(_db_manager, "session_factory", None):
+                    # Ensure the tick_history table exists (safe on repeated calls).
+                    from infrastructure.persistence.tick_history_models import TickHistoryModel  # noqa: F401 - register model
+                    async with _db_manager.engine.begin() as _conn:
+                        from infrastructure.persistence.database import Base
+                        await _conn.run_sync(
+                            lambda sync_conn: Base.metadata.create_all(
+                                sync_conn,
+                                tables=[TickHistoryModel.__table__],
+                                checkfirst=True,
+                            )
+                        )
+                    tick_history_writer = TickHistoryWriter(
+                        session_factory=_db_manager.session_factory,
+                        event_bus=event_bus,
+                    )
+                    await tick_history_writer.start()
+                    app.state.tick_history_writer = tick_history_writer
+                    logger.info("✅ TickHistoryWriter started (24-hour ring buffer)")
+                else:
+                    logger.warning(
+                        "no database in DI container: TickHistoryWriter NOT started. "
+                        "Tick history will not be persisted."
+                    )
+
+                TICK_COUNTERS.start_conservation_check()
+                logger.info(
+                    "✅ Tick conservation check started (every %ss)",
+                    os.environ.get("TICK_CONSERVATION_CHECK_SECONDS", "30"),
+                )
+            except Exception as _phase0_exc:  # noqa: BLE001
+                logger.error(
+                    "Phase 0 instrumentation could not start: %s — "
+                    "the server will trade normally but tick metrics will be unavailable.",
+                    _phase0_exc,
+                    exc_info=True,
+                )
+
+
         except KeyError as e:
             # A missing container component is a configuration error, and the message
             # names the component. Do not swallow it into the generic handler below.
@@ -806,6 +852,20 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
                 logger.info("ExpirationWorker stopped")
             except Exception as e:  # noqa: BLE001
                 logger.warning(f"Error stopping ExpirationWorker: {e}")
+
+        tick_history_writer = getattr(app.state, "tick_history_writer", None)
+        if tick_history_writer is not None:
+            try:
+                await tick_history_writer.stop()
+                logger.info("TickHistoryWriter stopped (final flush done)")
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"Error stopping TickHistoryWriter: {e}")
+
+        try:
+            from application.monitoring.tick_counters import TICK_COUNTERS
+            TICK_COUNTERS.stop_conservation_check()
+        except Exception:  # noqa: BLE001
+            pass
 
         valuation_service = getattr(app.state, "valuation_service", None)
         if valuation_service is not None:
@@ -957,6 +1017,27 @@ def create_app(container: Optional[Dict[str, Any]] = None) -> FastAPI:
             "checks": {"database": database, "event_bus": event_bus},
         }
         return JSONResponse(status_code=200 if healthy else 503, content=payload)
+
+    @app.get("/metrics", tags=["Metrics"], summary="System & tick pipeline metrics")
+    async def metrics_endpoint():
+        """Operational metrics endpoint exposing tick counters and pipeline health."""
+        from application.monitoring.tick_counters import TICK_COUNTERS
+        snap = TICK_COUNTERS.snapshot()
+        all_conservation_ok = all(s.get("conservation_ok", True) for s in snap.values())
+        return {
+            "status": "ok",
+            "conservation_ok": all_conservation_ok,
+            "ticks": snap,
+        }
+
+    @app.get("/metrics/ticks", tags=["Metrics"], summary="Per-symbol tick counters")
+    async def metrics_ticks_endpoint():
+        """Per-symbol tick counters across all stages."""
+        from application.monitoring.tick_counters import TICK_COUNTERS
+        return {
+            "counters": TICK_COUNTERS.snapshot(),
+            "note": "cumulative since process start; conservation_ok=false indicates unexplained drops",
+        }
 
     return app
 

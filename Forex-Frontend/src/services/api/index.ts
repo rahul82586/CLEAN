@@ -13,6 +13,7 @@ import { useSettingsStore } from '../../store/settingsStore';
 
 export * from './contract';
 export * from './errors';
+export * from './ticksStream';
 
 function activeTransport(): AdminApi {
     const { apiMode } = useSettingsStore.getState();
@@ -85,6 +86,7 @@ export const API: ApiFacade = {
     getGateways: (...a) => activeTransport().getGateways(...a),
     createGateway: (...a) => activeTransport().createGateway(...a),
     updateGateway: (...a) => activeTransport().updateGateway(...a),
+    deleteGateway: (...a) => activeTransport().deleteGateway(...a),
     testGateway: (...a) => activeTransport().testGateway(...a),
 
     getTicks: (...a) => activeTransport().getTicks(...a),
